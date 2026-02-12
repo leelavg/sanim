@@ -44,7 +44,11 @@ modprobe target_core_mod || true
 modprobe iscsi_target_mod || true
 mount -t configfs none /sys/kernel/config || true
 
-targetcli clearconfig confirm=true
+# Clear existing config (handle locked states gracefully)
+targetcli clearconfig confirm=true || {
+  echo "Warning: clearconfig failed, attempting to continue..."
+  targetcli ls || true
+}
 
 # Discover LUNs
 LUNS=($(ls /dev/${DEVICE_PREFIX}-* 2>/dev/null | sort -V || true))
@@ -168,6 +172,16 @@ if [ "${INSTALL_GLOBAL}" == "true" ]; then
   GLOBAL_IQN="${IQN_PREFIX}:global"
   GLOBAL_SVC="global-service.${NAMESPACE}.svc.cluster.local"
   
+  echo "Waiting for global target portal to be ready..."
+  for attempt in {1..10}; do
+    if timeout 1 bash -c "cat < /dev/tcp/${GLOBAL_SVC}/3260" 2>/dev/null; then
+      echo "Portal is listening on attempt $attempt"
+      break
+    fi
+    echo "Portal not ready, attempt $attempt/10..."
+    sleep 3
+  done
+  
   echo "Discovering global target at $GLOBAL_SVC..."
   for attempt in {1..5}; do
     if iscsiadm --mode discovery --type sendtargets --portal "$GLOBAL_SVC" 2>/dev/null; then
@@ -199,6 +213,22 @@ if [ "${INSTALL_ZONAL}" == "true" ]; then
   
   for IP in $IPS; do
     echo "Checking portal $IP for zone $LOCAL_ZONE..."
+    
+    # Pre-check: ensure portal is listening before discovery
+    PORTAL_READY=false
+    for check in {1..5}; do
+      if timeout 1 bash -c "cat < /dev/tcp/${IP}/3260" 2>/dev/null; then
+        PORTAL_READY=true
+        break
+      fi
+      sleep 1
+    done
+    
+    if [ "$PORTAL_READY" = false ]; then
+      echo "Portal $IP not listening on port 3260, skipping..."
+      continue
+    fi
+    
     # Use || true to continue if this portal is unready
     if iscsiadm --mode discovery --type sendtargets --portal "$IP" 2>/dev/null | grep -q "$LOCAL_ZONE_IQN"; then
       echo "Found matching zone target at $IP, logging in..."
@@ -211,7 +241,7 @@ if [ "${INSTALL_ZONAL}" == "true" ]; then
         sleep 2
       done
     else
-      echo "Portal $IP not ready or no matching zone, trying next..."
+      echo "Portal $IP ready but no matching zone, trying next..."
     fi
   done
 fi
@@ -254,7 +284,15 @@ $(echo "$STS_ZONAL_SCRIPT" | sed 's/^/    /')
   ds-init.sh: |
 $(echo "$DS_INIT_SCRIPT" | sed 's/^/    /')
 
-# Custom SecurityContextConstraints for privileged operations
+#, ServiceAccount for sanim pods
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: ${NAMESPACE}
+
+#, Custom SecurityContextConstraints for privileged operations
 ---
 apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
@@ -344,6 +382,18 @@ spec:
           readOnly: true
         - name: target-config
           mountPath: /etc/target
+        volumeDevices:
+YAML
+
+  # Generate volumeDevices for strict LUN mapping
+  for i in $(seq 0 $((GLOBAL_DISK_COUNT - 1))); do
+    cat >> resources.yaml <<YAML
+        - name: ${DEVICE_PREFIX}-$i
+          devicePath: /dev/${DEVICE_PREFIX}-$i
+YAML
+  done
+
+  cat >> resources.yaml <<YAML
         readinessProbe:
           exec:
             command:
@@ -467,6 +517,18 @@ spec:
           readOnly: true
         - name: target-config
           mountPath: /etc/target
+        volumeDevices:
+YAML
+
+  # Generate volumeDevices for strict LUN mapping
+  for i in $(seq 0 $((ZONAL_DISK_COUNT - 1))); do
+    cat >> resources.yaml <<YAML
+        - name: ${DEVICE_PREFIX}-$i
+          devicePath: /dev/${DEVICE_PREFIX}-$i
+YAML
+  done
+
+  cat >> resources.yaml <<YAML
         readinessProbe:
           exec:
             command:

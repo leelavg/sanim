@@ -177,22 +177,34 @@ else
     echo -e "${YELLOW}⚠ (${READY}/${DESIRED})${NC}"
 fi
 
-# Check iSCSI sessions on initiators
+# Check iSCSI sessions on initiators (kernel-level verification)
 INIT_PODS=$(oc get pods -n "${NAMESPACE}" -l app.kubernetes.io/component=initiator --no-headers -o custom-columns=":metadata.name" 2>/dev/null | head -3)
 if [ -n "$INIT_PODS" ]; then
-    echo "  iSCSI sessions (sample):"
+    echo "  Kernel iSCSI sessions (sample):"
     COUNT=0
+    SESSION_COUNT=0
     while IFS= read -r POD && [ $COUNT -lt 3 ]; do
         NODE=$(oc get pod "$POD" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
         echo "    ${POD} (${NODE}):"
-        SESSIONS=$(oc exec -n "${NAMESPACE}" "$POD" -- iscsiadm --mode session 2>/dev/null || echo "No sessions")
-        if [ "$SESSIONS" == "No sessions" ]; then
-            echo -e "      ${YELLOW}⚠ No active sessions${NC}"
+        
+        # Verify kernel sessions exist
+        SESSIONS=$(oc exec -n "${NAMESPACE}" "$POD" -- iscsiadm --mode session 2>/dev/null)
+        if [ -z "$SESSIONS" ]; then
+            echo -e "      ${YELLOW}⚠ No active kernel sessions${NC}"
         else
             echo "$SESSIONS" | sed 's/^/      /'
+            SESSION_COUNT=$((SESSION_COUNT + 1))
+            
+            # Verify block devices are visible
+            echo "      Block devices:"
+            oc exec -n "${NAMESPACE}" "$POD" -- lsblk -d -o NAME,SIZE,TYPE 2>/dev/null | grep disk | sed 's/^/        /' || echo -e "        ${YELLOW}⚠ No block devices found${NC}"
         fi
         COUNT=$((COUNT + 1))
     done <<< "$INIT_PODS"
+    
+    if [ $SESSION_COUNT -eq 0 ]; then
+        echo -e "  ${RED}✗ No kernel sessions found on any initiator${NC}"
+    fi
 fi
 
 # Summary

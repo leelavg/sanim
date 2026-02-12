@@ -249,6 +249,39 @@ oc get pods -n sanim-system -o custom-columns=NAME:.metadata.name,ZONE:.metadata
 - Not recommended for production workloads
 - No CHAP authentication configured by default
 
+## Multipath Configuration
+
+On OpenShift/RHCOS nodes with multipathd active, you must blacklist sanim devices to prevent the host from managing them:
+
+Add to /etc/multipath.conf on all worker nodes:
+```
+blacklist {
+    wwid ".*"
+    devnode "^sd[a-z]+"
+}
+blacklist_exceptions {
+    property "(SCSI_IDENT_|ID_WWN)"
+}
+blacklist {
+    device {
+        vendor "LIO-ORG"
+        product ".*"
+    }
+}
+```
+
+Or specifically blacklist by IQN pattern:
+```
+blacklist {
+    wwid "iqn.2026-02.com.thoughtexpo:storage.*"
+}
+```
+
+After updating, reload multipathd:
+```bash
+systemctl reload multipathd
+```
+
 ## Cleanup
 
 ```bash
