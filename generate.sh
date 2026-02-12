@@ -38,6 +38,12 @@ read -r -d '' STS_GLOBAL_SCRIPT <<'EOF' || true
 set -euo pipefail
 
 echo "Starting sanim global target..."
+
+# Load kernel modules and mount configfs
+modprobe target_core_mod || true
+modprobe iscsi_target_mod || true
+mount -t configfs none /sys/kernel/config || true
+
 targetcli clearconfig confirm=true
 
 # Discover LUNs
@@ -45,6 +51,13 @@ LUNS=($(ls /dev/${DEVICE_PREFIX}-* 2>/dev/null | sort -V || true))
 if [ ${#LUNS[@]} -eq 0 ]; then
   echo "Error: No LUNs found matching /dev/${DEVICE_PREFIX}-*"
   exit 1
+fi
+
+# Validate LUN count matches expected
+EXPECTED_COUNT=${GLOBAL_DISK_COUNT}
+if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
+  echo "Warning: Found ${#LUNS[@]} LUNs but expected $EXPECTED_COUNT"
+  echo "Discovered LUNs: ${LUNS[@]}"
 fi
 
 # Create iSCSI target
@@ -67,8 +80,8 @@ targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protec
 echo "Global target configured: $IQN with ${#LUNS[@]} LUNs"
 targetcli /iscsi ls
 
-# Keep running
-tail -f /dev/null
+# Keep running (sleep infinity allows proper signal handling)
+sleep infinity & wait
 EOF
 
 read -r -d '' STS_ZONAL_SCRIPT <<'EOF' || true
@@ -76,6 +89,12 @@ read -r -d '' STS_ZONAL_SCRIPT <<'EOF' || true
 set -euo pipefail
 
 echo "Starting sanim zonal target..."
+
+# Load kernel modules and mount configfs
+modprobe target_core_mod || true
+modprobe iscsi_target_mod || true
+mount -t configfs none /sys/kernel/config || true
+
 targetcli clearconfig confirm=true
 
 # Get zone from downward API
@@ -86,6 +105,13 @@ LUNS=($(ls /dev/${DEVICE_PREFIX}-* 2>/dev/null | sort -V || true))
 if [ ${#LUNS[@]} -eq 0 ]; then
   echo "Error: No LUNs found matching /dev/${DEVICE_PREFIX}-*"
   exit 1
+fi
+
+# Validate LUN count matches expected
+EXPECTED_COUNT=${ZONAL_DISK_COUNT}
+if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
+  echo "Warning: Found ${#LUNS[@]} LUNs but expected $EXPECTED_COUNT"
+  echo "Discovered LUNs: ${LUNS[@]}"
 fi
 
 # Create iSCSI target with zone suffix
@@ -108,8 +134,8 @@ targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protec
 echo "Zonal target configured: $IQN with ${#LUNS[@]} LUNs"
 targetcli /iscsi ls
 
-# Keep running
-tail -f /dev/null
+# Keep running (sleep infinity allows proper signal handling)
+sleep infinity & wait
 EOF
 
 read -r -d '' DS_INIT_SCRIPT <<'EOF' || true
@@ -129,6 +155,11 @@ cleanup() {
 }
 trap cleanup SIGTERM
 
+# Ensure host initiator name is used (avoid container's initiatorname.iscsi)
+if [ -f /etc/iscsi/initiatorname.iscsi ]; then
+  echo "Using host initiator name: $(cat /etc/iscsi/initiatorname.iscsi)"
+fi
+
 # Get local zone from downward API
 LOCAL_ZONE="${NODE_ZONE}"
 
@@ -138,10 +169,24 @@ if [ "${INSTALL_GLOBAL}" == "true" ]; then
   GLOBAL_SVC="global-service.${NAMESPACE}.svc.cluster.local"
   
   echo "Discovering global target at $GLOBAL_SVC..."
-  iscsiadm --mode discovery --type sendtargets --portal "$GLOBAL_SVC" || true
+  for attempt in {1..5}; do
+    if iscsiadm --mode discovery --type sendtargets --portal "$GLOBAL_SVC" 2>/dev/null; then
+      echo "Discovery successful on attempt $attempt"
+      break
+    fi
+    echo "Discovery attempt $attempt failed, retrying..."
+    sleep 2
+  done
   
   echo "Logging into global target $GLOBAL_IQN..."
-  iscsiadm --mode node --targetname "$GLOBAL_IQN" --portal "$GLOBAL_SVC" --login || true
+  for attempt in {1..5}; do
+    if iscsiadm --mode node --targetname "$GLOBAL_IQN" --portal "$GLOBAL_SVC" --login 2>/dev/null; then
+      echo "Login successful on attempt $attempt"
+      break
+    fi
+    echo "Login attempt $attempt failed, retrying..."
+    sleep 2
+  done
 fi
 
 # Login to zonal target if enabled
@@ -154,10 +199,19 @@ if [ "${INSTALL_ZONAL}" == "true" ]; then
   
   for IP in $IPS; do
     echo "Checking portal $IP for zone $LOCAL_ZONE..."
-    if iscsiadm --mode discovery --type sendtargets --portal "$IP" | grep -q "$LOCAL_ZONE_IQN"; then
-      echo "Found matching zone target, logging in..."
-      iscsiadm --mode node --targetname "$LOCAL_ZONE_IQN" --portal "$IP" --login || true
-      break
+    # Use || true to continue if this portal is unready
+    if iscsiadm --mode discovery --type sendtargets --portal "$IP" 2>/dev/null | grep -q "$LOCAL_ZONE_IQN"; then
+      echo "Found matching zone target at $IP, logging in..."
+      for attempt in {1..5}; do
+        if iscsiadm --mode node --targetname "$LOCAL_ZONE_IQN" --portal "$IP" --login 2>/dev/null; then
+          echo "Login successful on attempt $attempt"
+          break 2
+        fi
+        echo "Login attempt $attempt failed, retrying..."
+        sleep 2
+      done
+    else
+      echo "Portal $IP not ready or no matching zone, trying next..."
     fi
   done
 fi
@@ -168,8 +222,8 @@ iscsiadm --mode session || echo "No active sessions"
 echo "Block devices:"
 lsblk
 
-# Keep running
-tail -f /dev/null
+# Keep running (sleep infinity allows proper signal handling)
+sleep infinity & wait
 EOF
 
 # Start generating resources.yaml
@@ -285,6 +339,9 @@ spec:
         - name: dev
           mountPath: /dev
           mountPropagation: HostToContainer
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
         - name: target-config
           mountPath: /etc/target
         readinessProbe:
@@ -303,6 +360,9 @@ spec:
       - name: dev
         hostPath:
           path: /dev
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
       - name: target-config
         emptyDir: {}
   volumeClaimTemplates:
@@ -402,6 +462,9 @@ spec:
         - name: dev
           mountPath: /dev
           mountPropagation: HostToContainer
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
         - name: target-config
           mountPath: /etc/target
         readinessProbe:
@@ -420,6 +483,9 @@ spec:
       - name: dev
         hostPath:
           path: /dev
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
       - name: target-config
         emptyDir: {}
   volumeClaimTemplates:
