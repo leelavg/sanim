@@ -21,14 +21,15 @@ IMAGE="${IMAGE:-ghcr.io/leelavg/sanim:latest}"
 NODE_LABEL_FILTER="${NODE_LABEL_FILTER:-sanim-node=true}"
 FORCE_CLEANUP="${FORCE_CLEANUP:-false}"
 
-# Validation
-if [ "$INSTALL_GLOBAL" != "true" ] && [ "$INSTALL_ZONAL" != "true" ]; then
-  echo "Error: At least one of INSTALL_GLOBAL or INSTALL_ZONAL must be set to 'true'" >&2
+# Validation (hard stop before any YAML generation)
+if [ "$INSTALL_GLOBAL" == "true" ] && [ -z "$GLOBAL_ZONE" ]; then
+  echo "Error: GLOBAL_ZONE must be set when INSTALL_GLOBAL=true" >&2
+  echo "Example: GLOBAL_ZONE=us-east-1a" >&2
   exit 1
 fi
 
-if [ "$INSTALL_GLOBAL" == "true" ] && [ -z "$GLOBAL_ZONE" ]; then
-  echo "Error: GLOBAL_ZONE must be set when INSTALL_GLOBAL=true" >&2
+if [ "$INSTALL_GLOBAL" != "true" ] && [ "$INSTALL_ZONAL" != "true" ]; then
+  echo "Error: At least one of INSTALL_GLOBAL or INSTALL_ZONAL must be set to 'true'" >&2
   exit 1
 fi
 
@@ -46,7 +47,26 @@ mount -t configfs none /sys/kernel/config || true
 
 # Clear existing config (handle locked states gracefully)
 targetcli clearconfig confirm=true || {
-  echo "Warning: clearconfig failed, attempting to continue..."
+  echo "Warning: clearconfig failed, attempting forced cleanup..."
+  
+  # Try to remove orphaned objects from configfs
+  if [ -d /sys/kernel/config/target/iscsi ]; then
+    for iqn in /sys/kernel/config/target/iscsi/iqn.* 2>/dev/null; do
+      [ -d "$iqn" ] && echo "Removing orphaned IQN: $(basename $iqn)"
+      rmdir "$iqn/tpgt_1/acls/"* 2>/dev/null || true
+      rmdir "$iqn/tpgt_1/lun/"* 2>/dev/null || true
+      rmdir "$iqn/tpgt_1" 2>/dev/null || true
+      rmdir "$iqn" 2>/dev/null || true
+    done
+  fi
+  
+  if [ -d /sys/kernel/config/target/core ]; then
+    for backstore in /sys/kernel/config/target/core/iblock_*/* 2>/dev/null; do
+      [ -d "$backstore" ] && echo "Removing orphaned backstore: $(basename $backstore)"
+      rmdir "$backstore" 2>/dev/null || true
+    done
+  fi
+  
   targetcli ls || true
 }
 
@@ -151,13 +171,13 @@ echo "Starting sanim initiator..."
 # Trap for cleanup
 cleanup() {
   if [ "${FORCE_CLEANUP}" == "true" ]; then
-    echo "SIGTERM received, logging out from all sessions..."
+    echo "Signal received, logging out from all sessions..."
     iscsiadm --mode node --logoutall=all || true
   else
-    echo "SIGTERM received, keeping sessions active (FORCE_CLEANUP=false)"
+    echo "Signal received, keeping sessions active (FORCE_CLEANUP=false)"
   fi
 }
-trap cleanup SIGTERM
+trap cleanup SIGTERM SIGINT
 
 # Ensure host initiator name is used (avoid container's initiatorname.iscsi)
 if [ -f /etc/iscsi/initiatorname.iscsi ]; then

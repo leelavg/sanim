@@ -235,6 +235,28 @@ oc exec -n sanim-system <target-pod> -- targetcli /iscsi ls
 
 Ensure `FORCE_CLEANUP=false` in config.env. Sessions should survive pod restarts because they're managed by the host kernel.
 
+### Kernel-level iSCSI troubleshooting
+
+iSCSI login failures, CHAP mismatches, or session errors are often only visible in the host kernel logs. To view them:
+
+**From initiator pod (if /dev/kmsg is accessible):**
+```bash
+oc exec -n sanim-system <initiator-pod> -- cat /dev/kmsg | grep -i iscsi
+```
+
+**From the host node directly:**
+```bash
+oc debug node/<node-name>
+chroot /host
+dmesg | grep -i iscsi
+journalctl -k | grep -i iscsi
+```
+
+Common kernel messages to look for:
+- `connection1:0: detected conn error` - Network/portal issues
+- `session recovery timed out` - Target unreachable
+- `Login failed` - Authentication or target configuration issues
+
 ### Zone mismatch for zonal targets
 
 Verify pod zone labels:
@@ -298,8 +320,17 @@ oc delete pvc -n sanim-system --all
 
 - OpenShift 4.x or Kubernetes 1.20+
 - StorageClass with `WaitForFirstConsumer` binding mode
+- **StorageClass MUST support `volumeMode: Block`** (raw block volumes)
 - Nodes with `topology.kubernetes.io/zone` labels
 - Cluster admin privileges (for SCC creation)
+
+**Important**: Verify your StorageClass supports block volumes:
+```bash
+oc get storageclass <your-class> -o yaml | grep volumeBindingMode
+# Should show: volumeBindingMode: WaitForFirstConsumer
+```
+
+If your StorageClass doesn't support block mode, sanim PVCs will fail to bind.
 
 ## License
 
