@@ -1,0 +1,95 @@
+SANIM - SAN SIMULATOR
+=====================
+
+Project Overview:
+A zero-dependency Bash generator that provides iSCSI block storage on AWS/OpenShift 
+clusters using Fedora 43 containers. Designed for testing, development, and ephemeral 
+workloads.
+
+Architecture:
+- STS-Global: Single-replica StatefulSet exporting LUNs cluster-wide from one zone
+- STS-Zonal: Multi-replica StatefulSet (1 per zone) with shared-nothing architecture
+- DS-Initiator: DaemonSet maintaining iSCSI sessions via host kernel (survives restarts)
+- ConfigMap: Contains all entrypoint scripts (sts-global.sh, sts-zonal.sh, ds-init.sh)
+- SCC: Custom SecurityContextConstraints for privileged operations
+
+Key Design Decisions:
+1. StatefulSets provide stable DNS and sticky PVCs with zone affinity
+2. "Dumb" initiator pattern: sessions managed by host kernel, not container
+3. No iscsid in containers to avoid conflicts and ensure session persistence
+4. Downward API for zone detection (no kubectl dependency)
+5. Bidirectional mounts for /etc/iscsi and /var/lib/iscsi
+
+Configuration (config.env):
+- INSTALL_GLOBAL/INSTALL_ZONAL: Enable/disable deployment types
+- GLOBAL_DISK_COUNT/SIZE: Global LUN configuration
+- ZONAL_DISK_COUNT/SIZE: Per-zone LUN configuration
+- UNIQUE_ZONE_COUNT: Number of availability zones
+- IQN_PREFIX: iqn.2026-02.com.thoughtexpo:storage
+- IMAGE: ghcr.io/leelavg/sanim:latest
+- DEVICE_PREFIX: sanim (for PVC naming and LUN discovery)
+- FORCE_CLEANUP: Control session logout on pod termination
+
+Files Delivered:
+1. generate.sh (14KB) - Main generator with validation and conditional logic
+2. config.env (450B) - Configuration with all settings
+3. Containerfile (389B) - Fedora 43 with targetcli and iscsi-initiator-utils
+4. README.md (8.2KB) - Complete documentation with FAQ and troubleshooting
+5. validate.sh (8.8KB) - Post-deployment validation script
+6. resources.yaml (12.4KB) - Generated manifest with 7 resources
+
+Resource Headers:
+All resources use "#," prefix for easy inspection via: grep '^#,' resources.yaml
+
+Generated Resources:
+1. Namespace (sanim-system)
+2. ConfigMap (scripts with entrypoints)
+3. SecurityContextConstraints (sanim-privileged)
+4. StatefulSet + Service (global target, conditional)
+5. StatefulSet + Service (zonal targets, conditional)
+6. DaemonSet (initiators)
+
+Deployment Flow:
+1. User surveys cluster: oc get nodes --show-labels
+2. User edits config.env with zone and node filter settings
+3. Run: bash generate.sh
+4. Deploy: oc apply -f resources.yaml
+5. Validate: bash validate.sh
+
+Technical Highlights:
+- Zero external dependencies (pure Bash)
+- Proper YAML indentation and structure
+- Environment variable interpolation in scripts
+- Validation ensures at least one deployment type enabled
+- GLOBAL_ZONE required when INSTALL_GLOBAL=true
+- Node selector parsing handles empty values gracefully
+
+iSCSI Flow:
+Target (STS):
+- Runs targetcli to configure iSCSI targets
+- Exports block devices from PVCs as LUNs
+- One IQN per target type (global or zone-specific)
+- No CHAP authentication (simplified for dev/test)
+
+Initiator (DS):
+- Discovers targets via DNS (headless services)
+- Performs iscsiadm login to establish sessions
+- Sessions persist in host kernel (not container)
+- Zone-aware discovery for zonal targets
+- Sweeps all IPs to find matching zone target
+
+Security:
+- Custom SCC allows: hostPath, hostNetwork, hostPID, privileged containers
+- SCC bound to default ServiceAccount in namespace
+- automountServiceAccountToken: false (no K8s API access needed)
+
+Testing:
+Successfully generated 471-line resources.yaml with:
+- Correct YAML structure and indentation
+- All 7 resources with proper "#," headers
+- Conditional logic working for both global and zonal deployments
+- Scripts executable and ready for deployment
+
+Repository: leelavg/sanim
+Domain: com.thoughtexpo
+Image Registry: ghcr.io
