@@ -1,0 +1,36 @@
+1. THE CONTAINERFILE (sanim-engine):
+FROM registry.fedoraproject.org/fedora:43
+RUN dnf install -y util-linux targetcli iscsi-initiator-utils hostname procps-ng iproute jq && dnf clean all
+RUN mkdir -p /etc/target /var/lib/iscsi /etc/iscsi
+CMD ["/bin/bash"]
+
+2. GENERATE.SH LOGIC FLOW:
+- Source: [ -f config.env ] && . config.env
+- Defaults: Apply defaults (e.g., NAMESPACE=${NAMESPACE:-sanim-system}) AFTER sourcing.
+- Entrypoints: Use quoted Heredocs (read -r -d '' VAR <<'EOF') for scripts to avoid '$' escaping.
+- Indentation: Render scripts in ConfigMap using: $(echo "$VAR" | sed 's/^/     /')
+- Document Headers: Use the "# , <desc>" pattern for every resource.
+- Conditionals: Wrap Global and Zonal resource blocks in 'if [ "$INSTALL_X" == "true" ]' checks.
+
+3. ENTRYPOINT SCRIPTS:
+- sts.sh: Must run 'targetcli clearconfig confirm=true' on boot. Discover LUNs via 'ls /dev/${PREFIX}-* | sort -V'.
+- ds-init.sh: Perform 'iscsiadm' login. Include a TRAP on SIGTERM that ONLY logs out if 'FORCE_CLEANUP=true'.
+- Readiness: Add an exec readinessProbe: ["/bin/bash", "-c", "targetcli /iscsi ls | grep -q 'iqn'"].
+
+4. EXPLICIT ISCIADM COMMANDS:
+- Discovery: iscsiadm --mode discovery --type sendtargets --portal <DNS>
+- Login: iscsiadm --mode node --targetname <IQN> --portal <DNS> --login
+
+5. THE DISCOVERY SWEEP (ds-init.sh):
+IPS=$(getent hosts iscsi-zonal-service.$NAMESPACE.svc.cluster.local | awk '{print $1}')
+for IP in $IPS; do
+  if iscsiadm --mode discovery --type sendtargets --portal $IP | grep -q "$LOCAL_ZONE_IQN"; then
+    iscsiadm --mode node --targetname $LOCAL_ZONE_IQN --portal $IP --login
+  fi
+done
+
+6. MOUNT & SECURITY:
+- Target (STS): /dev (mountPropagation: HostToContainer).
+- Initiator (DS): /dev, /etc/iscsi, /var/lib/iscsi (mountPropagation: Bidirectional).
+- RBAC: Set 'automountServiceAccountToken: false'. Bind the 'sanim-privileged' SCC to the 'default' SA.
+- DS Context: Must have 'hostNetwork: true', 'hostPID: true', and 'privileged: true'.

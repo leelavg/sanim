@@ -1,0 +1,30 @@
+GOAL: Build 'sanim' (SAN Simulator), a zero-dependency Bash generator providing iSCSI block storage on AWS/OpenShift clusters using Fedora 43.
+
+IMPORTANT: Refer to 'hints.txt' for all specific code implementations, script snippets, and technical guardrails.
+
+THE FLOW:
+1. SURVEY: User runs 'oc get no --show-labels' to identify node labels and availability zones.
+2. CONFIG: User populates 'config.env' with pure key-value pairs (no bash syntax).
+3. GENERATION: 'generate.sh' sources 'config.env' first, then applies defaults before rendering 'resources.yaml'.
+
+RESOURCES OVERVIEW:
+- Choice Selection: User selects 'INSTALL_GLOBAL=true' and/or 'INSTALL_ZONAL=true'.
+- ConfigMap: The "Brain" containing entrypoint scripts: 'sts-global.sh', 'sts-zonal.sh', and 'ds-init.sh'.
+- SCC: A custom 'sanim-privileged' Security Context Constraint allowing hostPath, hostNetwork, hostPID, and privileged containers.
+- STS-Global (Shared): 1-replica STS anchored to a specific zone; exports X LUNs cluster-wide.
+- STS-Zonal (Shared-Nothing): Multi-replica STS (1 per zone); exports private LUNs fenced by zone-suffixed IQNs.
+- DS-Initiator: A "dumb" controller that performs the login and holds the session, letting the host kernel handle the data path.
+
+FAQ:
+Q: Why use StatefulSets (STS)?
+A: To provide stable DNS names and ensure PVCs remain "sticky" to zones via 'WaitForFirstConsumer' logic.
+Q: How do we avoid the 'iscsid' clash?
+A: Do NOT start 'iscsid' in the container. The container talks to the host kernel via bidirectional /etc/iscsi mounts.
+Q: Why is the DS "dumb"?
+A: To ensure stability. If the DS pod restarts, the kernel iSCSI session remains active, preventing I/O hangs.
+
+DOCUMENTATION REQUIREMENT:
+The generated 'resources.yaml' MUST include a descriptive header for every resource:
+#, <A single line description of the resource>
+---
+<resource content>

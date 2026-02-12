@@ -1,0 +1,23 @@
+ ok, all should be in txt format, generate prompt.txt which tells why and what we are trying to build, the how will be split in 2 files, prompt.txt will outline the flow and operations that will get triggered and hints.txt outlines all the little coding snippets
+
+this is the flow I'm thinking, improvise base don our conversation as well:
+user:
+forks the repo or just the generate.sh file
+does some oc commands to override any exports in config.env
+runs generate.sh which'll output a single yaml file with multiple documents, each document starts with a "#, <a single line description>, a new line then the content" (easy to do grep '^#,' resources.yaml later on)
+creates the yaml - it'll have namespace, rbac, configmap, scc, sts-shared or sts-noshare or both, corresponding service, ds-init
+
+runtime:
+sts-shared: creates luns and exports them, runs in a central zone and reachable via svc
+sts-noshare: creates luns and exports them, runs 1 per unique zone and reachable via svc
+ds-init: mounts the scsci disk, ie, X global, Y/zone for a toal of X+(Y*zone) disks
+
+all with proper setup and cleanup code
+
+env:
+global: count (2), size (10Gi), zone
+zonal: count (1), size (10Gi)
+iqnprefix, ns, sc, image, node-label-filter (for ds)
+
+project is sanim, containerfile with registry.fedoraproject.org/fedora:43 as base,
+all long options for iscsi, an faq section about why sts, dumb ds,  host <-> container flow.
