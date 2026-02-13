@@ -1,0 +1,791 @@
+#, Namespace for sanim resources
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+
+#, ConfigMap containing entrypoint scripts
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scripts
+  namespace: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+data:
+  sts-global.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    echo "Starting sanim global target..."
+    
+    # Mount configfs FIRST, then load modules
+    mount -t configfs none /sys/kernel/config 2>/dev/null || true
+    
+    # Load kernel modules in correct order
+    modprobe target_core_mod || true
+    modprobe target_core_iblock || true
+    modprobe iscsi_target_mod || true
+    
+    # Give kernel time to initialize
+    sleep 2
+    
+    # With hostNetwork, multiple pods share the same kernel target subsystem
+    # Clean up only our specific IQN and backstores
+    IQN="${IQN_PREFIX}:global"
+    if [ -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
+      echo "Cleaning up existing target: $IQN"
+      targetcli /iscsi delete "$IQN" 2>/dev/null || true
+    fi
+    
+    # Clean up our backstores (global uses lun0 to lun{GLOBAL_DISK_COUNT-1})
+    for i in $(seq 0 $((GLOBAL_DISK_COUNT - 1))); do
+      targetcli /backstores/block delete "lun$i" 2>/dev/null || true
+    done
+    
+    # Discover LUNs
+    LUNS=($(ls /dev/global-* 2>/dev/null | sort -V || true))
+    if [ ${#LUNS[@]} -eq 0 ]; then
+      echo "Error: No LUNs found matching /dev/global-*"
+      exit 1
+    fi
+    
+    # Validate LUN count matches expected
+    EXPECTED_COUNT=${GLOBAL_DISK_COUNT}
+    if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
+      echo "Warning: Found ${#LUNS[@]} LUNs but expected $EXPECTED_COUNT"
+      echo "Discovered LUNs: ${LUNS[@]}"
+    fi
+    
+    # Create iSCSI target
+    IQN="${IQN_PREFIX}:global"
+    targetcli /iscsi create "$IQN"
+    
+    # Keep the default ::0:3260 portal (it listens on both IPv4 and IPv6)
+    # No need to modify portals - the default works fine for pod networking
+    
+    # Enable the TPG (this actually binds the network portal and starts listening)
+    targetcli /iscsi/$IQN/tpg1 enable
+    
+    # Configure LUNs
+    for i in "${!LUNS[@]}"; do
+      LUN_PATH="${LUNS[$i]}"
+      targetcli /backstores/block create "lun$i" "$LUN_PATH"
+      targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/lun$i"
+    done
+    
+    # Disable authentication
+    targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
+    targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
+    
+    echo "Global target configured: $IQN with ${#LUNS[@]} LUNs"
+    targetcli /iscsi ls
+    
+    # Save configuration for persistence
+    targetcli saveconfig
+    
+    echo "Target ready and listening on port 3260"
+    ss -tlnp | grep 3260 || echo "Warning: Port 3260 not listening"
+    
+    # Keep running (sleep infinity allows proper signal handling)
+    sleep infinity & wait
+  sts-zonal.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    echo "Starting sanim zonal target..."
+    
+    # SELinux configuration happens via initiator DaemonSet (runs on all nodes)
+    # No need for hostPID on targets - DaemonSet handles it
+    
+    # Mount configfs FIRST, then load modules
+    mount -t configfs none /sys/kernel/config 2>/dev/null || true
+    
+    # Load kernel modules in correct order
+    modprobe target_core_mod || true
+    modprobe target_core_iblock || true
+    modprobe iscsi_target_mod || true
+    
+    # Give kernel time to initialize
+    sleep 2
+    
+    # Get zone from node-zone-map ConfigMap
+    NODE_IP="${NODE_IP}"
+    ZONE=$(grep "^${NODE_IP}=" /etc/zone-map/mapping | cut -d= -f2)
+    if [ -z "$ZONE" ]; then
+      echo "Error: Failed to find zone for node IP ${NODE_IP} in zone mapping"
+      exit 1
+    fi
+    echo "Detected zone: $ZONE (node IP: $NODE_IP)"
+    
+    # Clean up only our specific IQN and backstores
+    IQN="${IQN_PREFIX}:${ZONE}"
+    if [ -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
+      echo "Cleaning up existing target: $IQN"
+      targetcli /iscsi delete "$IQN" 2>/dev/null || true
+    fi
+    
+    # Clean up our backstores
+    for i in $(seq 0 $((ZONAL_DISK_COUNT - 1))); do
+      targetcli /backstores/block delete "zonal-lun$i" 2>/dev/null || true
+    done
+    
+    # Discover LUNs
+    LUNS=($(ls /dev/zonal-* 2>/dev/null | sort -V || true))
+    if [ ${#LUNS[@]} -eq 0 ]; then
+      echo "Error: No LUNs found matching /dev/zonal-*"
+      exit 1
+    fi
+    
+    # Validate LUN count matches expected
+    EXPECTED_COUNT=${ZONAL_DISK_COUNT}
+    if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
+      echo "Warning: Found ${#LUNS[@]} LUNs but expected $EXPECTED_COUNT"
+      echo "Discovered LUNs: ${LUNS[@]}"
+    fi
+    
+    # Create iSCSI target with zone suffix
+    IQN="${IQN_PREFIX}:${ZONE}"
+    targetcli /iscsi create "$IQN"
+    
+    # Disable TPG before modifying portals (TPG is auto-enabled on creation)
+    targetcli /iscsi/$IQN/tpg1 disable
+    
+    # Delete default portal and create on port 3261 to avoid conflict with global (port 3260)
+    targetcli /iscsi/$IQN/tpg1/portals delete ::0 3260 2>/dev/null || true
+    targetcli /iscsi/$IQN/tpg1/portals create 0.0.0.0 3261
+    
+    # Enable the TPG (this starts the listener)
+    targetcli /iscsi/$IQN/tpg1 enable
+    
+    # Configure LUNs
+    for i in "${!LUNS[@]}"; do
+      LUN_PATH="${LUNS[$i]}"
+      targetcli /backstores/block create "zonal-lun$i" "$LUN_PATH"
+      targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/zonal-lun$i"
+    done
+    
+    # Disable authentication
+    targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
+    targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
+    
+    echo "Zonal target configured: $IQN with ${#LUNS[@]} LUNs"
+    targetcli /iscsi ls
+    
+    # Save configuration for persistence
+    targetcli saveconfig
+    
+    echo "Target ready and listening on port 3261"
+    ss -tlnp | grep 3261 || echo "Warning: Port 3261 not listening"
+    
+    # Keep running (sleep infinity allows proper signal handling)
+    sleep infinity & wait
+  ds-init.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    echo "Starting sanim initiator..."
+    
+    # Configure SELinux to allow iSCSI on port 3261 (for zonal targets)
+    # Red Hat Solution: https://access.redhat.com/solutions/5170611
+    # SELinux only permits port 3260 by default; port 3261 must be explicitly added
+    # Note: DaemonSet runs on ALL nodes, so this configures both initiator and target nodes
+    echo "Configuring SELinux for iSCSI port 3261..."
+    nsenter -t 1 -m -u -i /usr/sbin/semanage port -a -t iscsi_port_t -p tcp 3261 2>/dev/null || true
+    
+    # Use host's iscsiadm via nsenter (Fedora 43 iscsiadm incompatible with RHEL CoreOS kernel)
+    # Note: nsenter uses host's mount namespace, so DNS resolution must happen before nsenter
+    ISCSIADM="nsenter -t 1 -m -u -i /usr/sbin/iscsiadm"
+    
+    # Helper function to resolve DNS name to IP (cluster DNS only works in container namespace)
+    resolve_host() {
+      local hostname="$1"
+      getent hosts "$hostname" | awk '{print $1}' | head -1
+    }
+    
+    # Generic function to check if session is healthy via sysfs
+    check_session_health() {
+      local iqn="$1"
+      for session in $(nsenter -t 1 -m bash -c "ls -d /sys/class/iscsi_session/session* 2>/dev/null || true"); do
+        targetname=$(nsenter -t 1 -m cat "$session/targetname" 2>/dev/null || echo "")
+        state=$(nsenter -t 1 -m cat "$session/state" 2>/dev/null || echo "")
+        if [ "$targetname" = "$iqn" ] && [ "$state" = "LOGGED_IN" ]; then
+          return 0
+        fi
+      done
+      return 1
+    }
+    
+    # Generic function to discover and login to target
+    discover_and_login() {
+      local iqn="$1"
+      local pod_dns="$2"
+      local port="${3:-3260}"  # Default to 3260 if not specified
+    
+      echo "Resolving $pod_dns..."
+      local ip=$(resolve_host "$pod_dns")
+      if [ -z "$ip" ]; then
+        echo "Error: Failed to resolve $pod_dns"
+        return 1
+      fi
+      echo "Resolved to $ip"
+    
+      echo "Discovering target at $ip:$port..."
+      for attempt in {1..5}; do
+        if $ISCSIADM --mode discovery --type sendtargets --portal "$ip:$port" 2>/dev/null; then
+          echo "Discovery successful on attempt $attempt"
+          break
+        fi
+        echo "Discovery attempt $attempt failed, retrying..."
+        sleep 2
+      done
+    
+      echo "Logging into target $iqn..."
+      for attempt in {1..5}; do
+        if $ISCSIADM --mode node --targetname "$iqn" --portal "$ip:$port" --login 2>/dev/null; then
+          echo "Login successful on attempt $attempt"
+          # Configure aggressive timeouts for fast failure detection
+          $ISCSIADM --mode node --targetname "$iqn" --portal "$ip:$port" --op update -n node.conn[0].timeo.noop_out_timeout -v 5 2>/dev/null || true
+          $ISCSIADM --mode node --targetname "$iqn" --portal "$ip:$port" --op update -n node.session.timeo.replacement_timeout -v 15 2>/dev/null || true
+          return 0
+        fi
+        echo "Login attempt $attempt failed, retrying..."
+        sleep 2
+      done
+    
+      echo "Warning: Failed to login to $iqn after all retries"
+      return 1
+    }
+    
+    # Session cleanup: Sessions persist in host kernel across pod restarts
+    # For cleanup, use the cleanup.sh script which handles both resources and sessions
+    
+    # Ensure host initiator name is used (avoid container's initiatorname.iscsi)
+    if [ -f /etc/iscsi/initiatorname.iscsi ]; then
+      echo "Using host initiator name: $(cat /etc/iscsi/initiatorname.iscsi)"
+    fi
+    
+    # Get local zone from node-zone-map ConfigMap
+    NODE_IP="${NODE_IP}"
+    LOCAL_ZONE=$(grep "^${NODE_IP}=" /etc/zone-map/mapping | cut -d= -f2)
+    if [ -z "$LOCAL_ZONE" ]; then
+      echo "Error: Failed to find zone for node IP ${NODE_IP} in zone mapping"
+      exit 1
+    fi
+    echo "Detected zone: $LOCAL_ZONE (node IP: $NODE_IP)"
+    
+    # Login to global target if enabled
+    if [ "${INSTALL_GLOBAL}" == "true" ]; then
+      GLOBAL_IQN="${IQN_PREFIX}:global"
+      GLOBAL_POD_DNS="global-0.global-service.${NAMESPACE}.svc.cluster.local"
+    
+      if check_session_health "$GLOBAL_IQN"; then
+        echo "Healthy session already exists for $GLOBAL_IQN, skipping login"
+      else
+        echo "No healthy session found, cleaning up stale sessions for $GLOBAL_IQN..."
+        $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --logout 2>/dev/null || true
+        $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --op delete 2>/dev/null || true
+        discover_and_login "$GLOBAL_IQN" "$GLOBAL_POD_DNS"
+      fi
+    fi
+    
+    # Login to zonal target if enabled
+    if [ "${INSTALL_ZONAL}" == "true" ]; then
+      LOCAL_ZONE_IQN="${IQN_PREFIX}:${LOCAL_ZONE}"
+      # Zone name may have dots, replace with dashes for DNS-safe service name
+      LOCAL_ZONE_SAFE=$(echo "$LOCAL_ZONE" | tr '.' '-')
+      ZONAL_POD_DNS="zonal-${LOCAL_ZONE_SAFE}-0.zonal-${LOCAL_ZONE_SAFE}-service.${NAMESPACE}.svc.cluster.local"
+    
+      if check_session_health "$LOCAL_ZONE_IQN"; then
+        echo "Healthy session already exists for $LOCAL_ZONE_IQN, skipping login"
+      else
+        echo "No healthy session found, cleaning up stale sessions for $LOCAL_ZONE_IQN..."
+        $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --logout 2>/dev/null || true
+        $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --op delete 2>/dev/null || true
+        discover_and_login "$LOCAL_ZONE_IQN" "$ZONAL_POD_DNS" 3261
+      fi
+    fi
+    
+    echo "Initial iSCSI sessions active:"
+    $ISCSIADM --mode session || echo "No active sessions"
+    
+    echo "Block devices:"
+    lsblk
+    
+    # Monitor loop: check session health via sysfs and reconnect if needed
+    echo "Starting session monitor loop (checking every 10s)..."
+    while true; do
+      if [ "${INSTALL_GLOBAL}" == "true" ]; then
+        GLOBAL_IQN="${IQN_PREFIX}:global"
+        GLOBAL_POD_DNS="global-0.global-service.${NAMESPACE}.svc.cluster.local"
+    
+        if ! check_session_health "$GLOBAL_IQN"; then
+          echo "$(date): Global session unhealthy or missing, cleaning up..."
+          $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --logout 2>/dev/null || true
+          $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --op delete 2>/dev/null || true
+          echo "$(date): Rediscovering and logging in..."
+          discover_and_login "$GLOBAL_IQN" "$GLOBAL_POD_DNS" || echo "Failed to re-establish global session"
+        fi
+      fi
+    
+      if [ "${INSTALL_ZONAL}" == "true" ]; then
+        LOCAL_ZONE_IQN="${IQN_PREFIX}:${LOCAL_ZONE}"
+        LOCAL_ZONE_SAFE=$(echo "$LOCAL_ZONE" | tr '.' '-')
+        ZONAL_POD_DNS="zonal-${LOCAL_ZONE_SAFE}-0.zonal-${LOCAL_ZONE_SAFE}-service.${NAMESPACE}.svc.cluster.local"
+    
+        if ! check_session_health "$LOCAL_ZONE_IQN"; then
+          echo "$(date): Zonal session unhealthy or missing, cleaning up..."
+          $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --logout 2>/dev/null || true
+          $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --op delete 2>/dev/null || true
+          echo "$(date): Rediscovering and logging in..."
+          discover_and_login "$LOCAL_ZONE_IQN" "$ZONAL_POD_DNS" 3261 || echo "Failed to re-establish zonal session"
+        fi
+      fi
+    
+      # Use sleep with background process and wait to allow trap to interrupt
+      sleep 10 & wait $!
+    done
+
+#, ServiceAccount for sanim pods
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sanim
+  namespace: sanim-system
+
+#, SecurityContextConstraints for iSCSI targets
+---
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: sanim-target
+  labels:
+    app.kubernetes.io/name: sanim
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: true
+allowHostPID: false
+allowHostPorts: true
+allowPrivilegedContainer: true
+allowedCapabilities:
+- SYS_ADMIN
+- SYS_MODULE
+- NET_ADMIN
+defaultAddCapabilities: null
+fsGroup:
+  type: RunAsAny
+priority: null
+readOnlyRootFilesystem: false
+requiredDropCapabilities: null
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+users:
+- system:serviceaccount:sanim-system:sanim-target
+volumes:
+- configMap
+- emptyDir
+- hostPath
+- persistentVolumeClaim
+
+#, SecurityContextConstraints for iSCSI initiators
+---
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: sanim-initiator
+  labels:
+    app.kubernetes.io/name: sanim
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: true
+allowHostPID: true
+allowHostPorts: false
+allowPrivilegedContainer: true
+allowedCapabilities:
+- SYS_ADMIN
+- SYS_MODULE
+defaultAddCapabilities: null
+fsGroup:
+  type: RunAsAny
+priority: null
+readOnlyRootFilesystem: false
+requiredDropCapabilities: null
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+users:
+- system:serviceaccount:sanim-system:sanim-initiator
+volumes:
+- configMap
+- hostPath
+
+#, ServiceAccount for iSCSI targets
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sanim-target
+  namespace: sanim-system
+
+#, ServiceAccount for iSCSI initiators
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sanim-initiator
+  namespace: sanim-system
+
+#, StatefulSet for global shared iSCSI target
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: global
+  namespace: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+    app.kubernetes.io/component: target
+    sanim.io/type: global
+spec:
+  serviceName: global-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sanim
+      app.kubernetes.io/component: target
+      sanim.io/type: global
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sanim
+        app.kubernetes.io/component: target
+        sanim.io/type: global
+    spec:
+      serviceAccountName: sanim-target
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 2
+      # Using pod networking for proper Service routing
+      # Note: iSCSI sessions will break on pod restart - initiators must reconnect
+      nodeSelector:
+        topology.kubernetes.io/zone: us-east-1d
+      containers:
+      - name: target
+        image: ghcr.io/leelavg/sanim:latest
+        command: ["/bin/bash", "/scripts/sts-global.sh"]
+        env:
+        - name: IQN_PREFIX
+          value: "iqn.2020-05.com.thoughtexpo:storage"
+        - name: GLOBAL_DISK_COUNT
+          value: "2"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: target-config
+          mountPath: /etc/target
+        - name: dbus
+          mountPath: /var/run/dbus
+          readOnly: true
+        - name: sys-kernel-config
+          mountPath: /sys/kernel/config
+        volumeDevices:
+        - name: global-0
+          devicePath: /dev/global-0
+        - name: global-1
+          devicePath: /dev/global-1
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - targetcli /iscsi ls | grep -q 'iqn'
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: scripts
+        configMap:
+          name: scripts
+          defaultMode: 0755
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+      - name: target-config
+        emptyDir: {}
+      - name: dbus
+        hostPath:
+          path: /var/run/dbus
+      - name: sys-kernel-config
+        hostPath:
+          path: /sys/kernel/config
+  volumeClaimTemplates:
+  - metadata:
+      name: global-0
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3-csi
+      volumeMode: Block
+      resources:
+        requests:
+          storage: 5Gi
+  - metadata:
+      name: global-1
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3-csi
+      volumeMode: Block
+      resources:
+        requests:
+          storage: 5Gi
+
+#, Headless Service for global target (provides stable pod DNS)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: global-service
+  namespace: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+    app.kubernetes.io/component: target
+    sanim.io/type: global
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: sanim
+    app.kubernetes.io/component: target
+    sanim.io/type: global
+  ports:
+  - name: iscsi
+    port: 3260
+    targetPort: 3260
+    protocol: TCP
+
+#, StatefulSet for zone us-east-1d
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zonal-us-east-1d
+  namespace: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+    app.kubernetes.io/component: target
+    sanim.io/type: zonal
+    sanim.io/zone: us-east-1d
+spec:
+  serviceName: zonal-us-east-1d-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sanim
+      app.kubernetes.io/component: target
+      sanim.io/type: zonal
+      sanim.io/zone: us-east-1d
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sanim
+        app.kubernetes.io/component: target
+        sanim.io/type: zonal
+        sanim.io/zone: us-east-1d
+    spec:
+      serviceAccountName: sanim-target
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 2
+      nodeSelector:
+        topology.kubernetes.io/zone: us-east-1d
+      containers:
+      - name: target
+        image: ghcr.io/leelavg/sanim:latest
+        command: ["/bin/bash", "/scripts/sts-zonal.sh"]
+        env:
+        - name: IQN_PREFIX
+          value: "iqn.2020-05.com.thoughtexpo:storage"
+        - name: ZONAL_DISK_COUNT
+          value: "1"
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: target-config
+          mountPath: /etc/target
+        - name: dbus
+          mountPath: /var/run/dbus
+          readOnly: true
+        - name: sys-kernel-config
+          mountPath: /sys/kernel/config
+        - name: zone-map
+          mountPath: /etc/zone-map
+          readOnly: true
+        volumeDevices:
+        - name: zonal-0
+          devicePath: /dev/zonal-0
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - targetcli /iscsi ls | grep -q 'iqn'
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: scripts
+        configMap:
+          name: scripts
+          defaultMode: 0755
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+      - name: target-config
+        emptyDir: {}
+      - name: dbus
+        hostPath:
+          path: /var/run/dbus
+      - name: sys-kernel-config
+        hostPath:
+          path: /sys/kernel/config
+      - name: zone-map
+        configMap:
+          name: node-zone-map
+  volumeClaimTemplates:
+  - metadata:
+      name: zonal-0
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3-csi
+      volumeMode: Block
+      resources:
+        requests:
+          storage: 5Gi
+
+#, Headless Service for zone us-east-1d
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zonal-us-east-1d-service
+  namespace: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+    app.kubernetes.io/component: target
+    sanim.io/type: zonal
+    sanim.io/zone: us-east-1d
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: sanim
+    app.kubernetes.io/component: target
+    sanim.io/type: zonal
+    sanim.io/zone: us-east-1d
+  ports:
+  - name: iscsi
+    port: 3261
+    targetPort: 3261
+    protocol: TCP
+
+#, DaemonSet for iSCSI initiators (dumb controller)
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: initiator
+  namespace: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+    app.kubernetes.io/component: initiator
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sanim
+      app.kubernetes.io/component: initiator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sanim
+        app.kubernetes.io/component: initiator
+    spec:
+      serviceAccountName: sanim-initiator
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 2
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role.kubernetes.io/worker: ""
+      containers:
+      - name: initiator
+        image: ghcr.io/leelavg/sanim:latest
+        command: ["/bin/bash", "/scripts/ds-init.sh"]
+        env:
+        - name: NAMESPACE
+          value: "sanim-system"
+        - name: IQN_PREFIX
+          value: "iqn.2020-05.com.thoughtexpo:storage"
+        - name: INSTALL_GLOBAL
+          value: "true"
+        - name: INSTALL_ZONAL
+          value: "true"
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        securityContext:
+          privileged: true
+        terminationMessagePath: /tmp/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: dev
+          mountPath: /dev
+          mountPropagation: HostToContainer
+        - name: iscsi-config
+          mountPath: /etc/iscsi
+          mountPropagation: HostToContainer
+        - name: iscsi-lib
+          mountPath: /var/lib/iscsi
+          mountPropagation: HostToContainer
+        - name: zone-map
+          mountPath: /etc/zone-map
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: scripts
+          defaultMode: 0755
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: iscsi-config
+        hostPath:
+          path: /etc/iscsi
+      - name: iscsi-lib
+        hostPath:
+          path: /var/lib/iscsi
+      - name: zone-map
+        configMap:
+          name: node-zone-map

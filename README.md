@@ -31,6 +31,8 @@ resources.yaml:685:#, Headless Service for zone us-east-1d
 resources.yaml:710:#, DaemonSet for iSCSI initiators (dumb controller)
 ```
 
+I had looked at docs of [piraeus-operator](https://github.com/piraeusdatastore/piraeus-operator), [jiva-operator](https://github.com/openebs-archive/jiva-operator) and [longhorn](https://github.com/longhorn/longhorn), either I had to shave off something from those or build from start to get to shaved off existing solutions and I had to choose the latter.
+
 ## AI Generated
 
 **sanim** (SAN Simulator) is a zero-dependency Bash generator that provides iSCSI block storage on AWS/OpenShift clusters using Fedora 43 containers. Battle-tested through live cluster deployment with comprehensive fixes applied.

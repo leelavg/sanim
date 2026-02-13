@@ -1,0 +1,22 @@
+#, Namespace for sanim resources
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+
+#, ConfigMap for node-to-zone mapping
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-zone-map
+  namespace: sanim-system
+  labels:
+    app.kubernetes.io/name: sanim
+data:
+  mapping: |
+    10.0.1.192=us-east-1d
+    10.0.1.216=us-east-1d
