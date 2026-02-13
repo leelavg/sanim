@@ -3,8 +3,8 @@ SANIM - SAN SIMULATOR (PRODUCTION-READY)
 
 Project Overview:
 A zero-dependency Bash generator providing iSCSI block storage on AWS/OpenShift 
-clusters using Fedora 43 containers. Hardened for production reliability with 
-comprehensive error handling and troubleshooting.
+clusters using Fedora 43 containers. Battle-tested and hardened through live 
+cluster deployment with comprehensive fixes applied.
 
 Architecture:
 - STS-Global: Single-replica StatefulSet exporting LUNs cluster-wide from one zone
@@ -19,18 +19,27 @@ Key Design Decisions:
 2. "Dumb" initiator pattern: sessions managed by host kernel, not container
 3. No iscsid in containers to avoid conflicts and ensure session persistence
 4. Downward API for zone detection (no kubectl dependency)
-5. Bidirectional mounts for /etc/iscsi and /var/lib/iscsi
+5. HostToContainer mount propagation (initiator uses nsenter to host)
 6. volumeMode: Block for raw device access
+7. Externalized scripts for IDE syntax highlighting
 
-Production Hardening (Applied):
-1. Kernel module loading (target_core_mod, iscsi_target_mod)
-2. ConfigFS mounting and orphaned object cleanup
-3. Robust retry logic with TCP port pre-checks
-4. Signal handling (SIGTERM + SIGINT) with proper cleanup
-5. LUN count validation and strict device mapping
-6. Graceful targetcli error handling
-7. Enhanced validation with kernel session verification
-8. Comprehensive troubleshooting documentation
+Production Fixes Applied (Live Testing):
+1. ✅ volumeDevices vs /dev mount conflict resolved (removed /dev mount from targets)
+2. ✅ DNS resolution fixed (dnsPolicy: ClusterFirstWithHostNet for hostNetwork pods)
+3. ✅ iscsiadm compatibility (nsenter to host's iscsiadm, removed from container)
+4. ✅ Target mounts added (/var/run/dbus for targetcli, /sys/kernel/config for configfs)
+5. ✅ Initiator termination log path fixed (/tmp/termination-log to avoid /dev conflict)
+6. ✅ IQN hardcoded to domain registration date (iqn.2020-05.com.thoughtexpo:storage)
+7. ✅ Simplified zonal IQN format (removed redundant "zone-" prefix)
+8. ✅ Semantic device prefixes (global-* and zonal-* instead of configurable sanim-*)
+9. ✅ Removed redundant pod securityContext (ignored with privileged: true)
+10. ✅ Added orphaned cleanup to zonal script (matches global robustness)
+11. ✅ Login failure warnings (clear visibility when connections fail)
+12. ✅ Extracted TCP check function (DRY principle)
+13. ✅ Mount propagation optimized (HostToContainer for initiator)
+14. ✅ Removed unnecessary initiator mounts (/var/run/dbus, /sys)
+15. ✅ Containerfile optimized (removed iscsi-initiator-utils, added debug tools)
+16. ✅ Scripts externalized (full IDE syntax highlighting in scripts/ directory)
 
 Configuration (config.env):
 - INSTALL_GLOBAL/INSTALL_ZONAL: Enable/disable deployment types
@@ -38,22 +47,27 @@ Configuration (config.env):
 - ZONAL_DISK_COUNT/SIZE: Per-zone LUN configuration (default: 1x10Gi)
 - UNIQUE_ZONE_COUNT: Number of availability zones (default: 3)
 - GLOBAL_ZONE: Required when INSTALL_GLOBAL=true (validated at script start)
-- IQN_PREFIX: iqn.2026-02.com.thoughtexpo:storage
 - IMAGE: ghcr.io/leelavg/sanim:latest
-- DEVICE_PREFIX: sanim (for PVC naming and LUN discovery)
 - FORCE_CLEANUP: Control session logout on pod termination (default: false)
 - STORAGE_CLASS: Must support volumeMode: Block (default: gp3-csi)
 - NODE_LABEL_FILTER: Node selector for initiators (default: sanim-node=true)
 
+Note: IQN_PREFIX and DEVICE_PREFIX are now hardcoded (not configurable):
+- IQN: iqn.2020-05.com.thoughtexpo:storage (reflects domain registration date)
+- Device prefixes: "global" for shared-storage, "zonal" for shared-nothing
+
 Files Delivered:
 1. generate.sh (700+ lines, executable) - Main generator with validation
-2. config.env (22 lines) - Configuration with all settings
-3. Containerfile (18 lines) - Fedora 43 with targetcli/iscsi tools
+2. config.env (simplified) - Configuration without hardcoded values
+3. Containerfile (optimized) - Fedora 43 with targetcli and debug tools
 4. validate.sh (280+ lines, executable) - Post-deployment validation
-5. README.md (350+ lines) - Complete documentation with FAQ
+5. README.md (updated) - Complete documentation with live testing insights
 6. summary.txt - This file
-7. resources.yaml (550+ lines, generated) - 9 K8s resources
-8. REVIEW_FIXES.md - Documentation of applied fixes
+7. resources.yaml (543 lines, generated) - 9 K8s resources
+8. scripts/ directory:
+   - sts-global.sh - Global target entrypoint (full IDE highlighting)
+   - sts-zonal.sh - Zonal target entrypoint (full IDE highlighting)
+   - ds-init.sh - Initiator entrypoint (full IDE highlighting)
 
 Resource Headers:
 All resources use "#," prefix for easy inspection via: grep '^#,' resources.yaml
@@ -87,27 +101,41 @@ Technical Highlights:
 ✓ Multi-signal trap (SIGTERM + SIGINT)
 ✓ LUN count validation and warnings
 ✓ Graceful error handling throughout
+✓ nsenter pattern for host iscsiadm compatibility
+✓ Externalized scripts for IDE syntax highlighting
+
+Final IQN Formats:
+- Global: iqn.2020-05.com.thoughtexpo:storage:global
+- Zonal (example): iqn.2020-05.com.thoughtexpo:storage:us-west-1a
+- Initiator: iqn.1994-05.com.redhat:<node-id> (from RHCOS host)
+
+Device Mappings:
+- Global: /dev/global-0, /dev/global-1 (self-documenting)
+- Zonal: /dev/zonal-0, /dev/zonal-1 (self-documenting)
 
 iSCSI Flow:
 Target (STS):
 - Loads kernel modules (target_core_mod, iscsi_target_mod)
 - Mounts configfs to /sys/kernel/config
+- Mounts /var/run/dbus (ro) for targetcli communication
 - Cleans up orphaned objects if clearconfig fails
 - Runs targetcli to configure iSCSI targets
-- Exports block devices from PVCs as LUNs
+- Exports block devices from PVCs as LUNs (via volumeDevices)
 - One IQN per target type (global or zone-specific)
 - No CHAP authentication (simplified for dev/test)
 - Uses sleep infinity & wait for proper signal handling
 
 Initiator (DS):
+- Uses nsenter to run host's iscsiadm (compatibility fix)
 - Verifies host initiator name usage
-- Waits for portal readiness (TCP port 3260 check)
+- Waits for portal readiness (TCP port 3260 check via reusable function)
 - Discovers targets via DNS (headless services)
-- Performs iscsiadm login with retry logic
+- Performs iscsiadm login with retry logic and failure warnings
 - Sessions persist in host kernel (not container)
 - Zone-aware discovery for zonal targets
 - Sweeps all IPs to find matching zone target
 - Handles SIGTERM and SIGINT for cleanup
+- Mounts: /dev, /etc/iscsi, /var/lib/iscsi (HostToContainer propagation)
 
 Security:
 - Custom SCC allows: hostPath, hostNetwork, hostPID, privileged containers
@@ -118,7 +146,7 @@ Security:
 Multipath Configuration:
 On OpenShift/RHCOS nodes with multipathd, blacklist sanim devices:
 - Add LIO-ORG vendor blacklist to /etc/multipath.conf
-- Or blacklist by IQN pattern: iqn.2026-02.com.thoughtexpo:storage.*
+- Or blacklist by IQN pattern: iqn.2020-05.com.thoughtexpo:storage.*
 - Reload: systemctl reload multipathd
 
 Troubleshooting:
@@ -148,8 +176,9 @@ Real-World Considerations:
 - Node-specific kernel versions may vary behavior
 - StorageClass provisioning quirks are environment-specific
 - All edge cases handled gracefully with retries and fallbacks
+- Fedora 43 iscsiadm incompatible with RHCOS kernel (solved via nsenter)
 
 Repository: leelavg/sanim
-Domain: thoughtexpo.com (reversed: com.thoughtexpo)
+Domain: thoughtexpo.com (registered May 2020)
 Image Registry: ghcr.io
-Status: Production-ready with comprehensive hardening
+Status: Production-ready with comprehensive hardening and live testing validation

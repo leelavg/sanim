@@ -1,18 +1,28 @@
 FROM registry.fedoraproject.org/fedora:43
 
-# Install required packages for iSCSI target and initiator operations
+# Install packages:
+# - targetcli: iSCSI target configuration (targets only)
+# - util-linux: nsenter, lsblk, mount
+# - procps-ng: ps, top
+# - iproute: ss, ip
+# Good to have for debugging:
+# - bind-utils: nslookup, dig (DNS debugging)
+# - iputils: ping
+# - tcpdump: network debugging
 RUN dnf install -y \
-    util-linux \
     targetcli \
-    iscsi-initiator-utils \
-    hostname \
+    util-linux \
     procps-ng \
     iproute \
-    jq \
+    bind-utils \
+    iputils \
+    tcpdump \
     && dnf clean all
 
+# Note: iscsi-initiator-utils NOT needed - we use nsenter to host's iscsiadm
+
 # Create required directories
-RUN mkdir -p /etc/target /var/lib/iscsi /etc/iscsi
+RUN mkdir -p /etc/target
 
 # Default command
 CMD ["/bin/bash"]

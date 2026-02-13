@@ -1,6 +1,23 @@
 #!/bin/bash
 set -euo pipefail
 
+# Parse command line arguments
+MAP_ONLY=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -m|--map-only)
+      MAP_ONLY=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Usage: $0 [-m|--map-only]" >&2
+      echo "  -m, --map-only  Only generate/update node-zone-map ConfigMap (requires oc)" >&2
+      exit 1
+      ;;
+  esac
+done
+
 # Source user configuration if exists
 [ -f config.env ] && source config.env
 
@@ -14,12 +31,11 @@ GLOBAL_ZONE="${GLOBAL_ZONE:-us-east-1a}"
 ZONAL_DISK_COUNT="${ZONAL_DISK_COUNT:-1}"
 ZONAL_DISK_SIZE="${ZONAL_DISK_SIZE:-10Gi}"
 UNIQUE_ZONE_COUNT="${UNIQUE_ZONE_COUNT:-3}"
-IQN_PREFIX="${IQN_PREFIX:-iqn.2026-02.com.thoughtexpo:storage}"
 STORAGE_CLASS="${STORAGE_CLASS:-gp3-csi}"
-DEVICE_PREFIX="${DEVICE_PREFIX:-sanim}"
 IMAGE="${IMAGE:-ghcr.io/leelavg/sanim:latest}"
 NODE_LABEL_FILTER="${NODE_LABEL_FILTER:-sanim-node=true}"
 FORCE_CLEANUP="${FORCE_CLEANUP:-false}"
+IQN_PREFIX="iqn.2020-05.com.thoughtexpo:storage"
 
 # Validation (hard stop before any YAML generation)
 if [ "$INSTALL_GLOBAL" == "true" ] && [ -z "$GLOBAL_ZONE" ]; then
@@ -33,248 +49,50 @@ if [ "$INSTALL_GLOBAL" != "true" ] && [ "$INSTALL_ZONAL" != "true" ]; then
   exit 1
 fi
 
-# Entrypoint scripts using quoted heredocs
-read -r -d '' STS_GLOBAL_SCRIPT <<'EOF' || true
-#!/bin/bash
-set -euo pipefail
+SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")/scripts"
+STS_GLOBAL_SCRIPT=$(cat "$SCRIPT_DIR/sts-global.sh")
+STS_ZONAL_SCRIPT=$(cat "$SCRIPT_DIR/sts-zonal.sh")
+DS_INIT_SCRIPT=$(cat "$SCRIPT_DIR/ds-init.sh")
 
-echo "Starting sanim global target..."
-
-# Load kernel modules and mount configfs
-modprobe target_core_mod || true
-modprobe iscsi_target_mod || true
-mount -t configfs none /sys/kernel/config || true
-
-# Clear existing config (handle locked states gracefully)
-targetcli clearconfig confirm=true || {
-  echo "Warning: clearconfig failed, attempting forced cleanup..."
+# ============================================================================
+# NETWORK-DEPENDENT FUNCTION (requires oc CLI)
+# ============================================================================
+# Queries cluster to build node-to-zone mapping data using jsonpath
+# This function makes network calls using 'oc' command
+generate_zone_map_configmap() {
+  local mapping=""
+  mapping=$(oc get nodes -o jsonpath='{range .items[*]}{"    "}{.status.addresses[?(@.type=="InternalIP")].address}{"="}{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}{end}' -l "$NODE_LABEL_FILTER")
   
-  # Try to remove orphaned objects from configfs
-  if [ -d /sys/kernel/config/target/iscsi ]; then
-    for iqn in /sys/kernel/config/target/iscsi/iqn.* 2>/dev/null; do
-      [ -d "$iqn" ] && echo "Removing orphaned IQN: $(basename $iqn)"
-      rmdir "$iqn/tpgt_1/acls/"* 2>/dev/null || true
-      rmdir "$iqn/tpgt_1/lun/"* 2>/dev/null || true
-      rmdir "$iqn/tpgt_1" 2>/dev/null || true
-      rmdir "$iqn" 2>/dev/null || true
-    done
+  if [ -z "$mapping" ]; then
+    echo "Error: No nodes with zone labels found" >&2
+    exit 1
   fi
   
-  if [ -d /sys/kernel/config/target/core ]; then
-    for backstore in /sys/kernel/config/target/core/iblock_*/* 2>/dev/null; do
-      [ -d "$backstore" ] && echo "Removing orphaned backstore: $(basename $backstore)"
-      rmdir "$backstore" 2>/dev/null || true
-    done
-  fi
-  
-  targetcli ls || true
+  cat <<EOF
+#, ConfigMap for node-to-zone mapping
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-zone-map
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: sanim
+data:
+  mapping: |
+${mapping}
+EOF
 }
+# ============================================================================
 
-# Discover LUNs
-LUNS=($(ls /dev/${DEVICE_PREFIX}-* 2>/dev/null | sort -V || true))
-if [ ${#LUNS[@]} -eq 0 ]; then
-  echo "Error: No LUNs found matching /dev/${DEVICE_PREFIX}-*"
-  exit 1
+# Handle -m flag: only generate/update zone-map ConfigMap
+if [ "$MAP_ONLY" == "true" ]; then
+  echo "Using 'oc' to query node to zone mapping"
+  generate_zone_map_configmap > node-zone-map.yaml
+  echo "Generated node-zone-map.yaml successfully!"
+  echo "Apply with: oc apply -f node-zone-map.yaml --server-side --force-conflicts"
+  exit 0
 fi
-
-# Validate LUN count matches expected
-EXPECTED_COUNT=${GLOBAL_DISK_COUNT}
-if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
-  echo "Warning: Found ${#LUNS[@]} LUNs but expected $EXPECTED_COUNT"
-  echo "Discovered LUNs: ${LUNS[@]}"
-fi
-
-# Create iSCSI target
-IQN="${IQN_PREFIX}:global"
-targetcli /iscsi create "$IQN"
-targetcli /iscsi/$IQN/tpg1/portals delete 0.0.0.0 3260
-targetcli /iscsi/$IQN/tpg1/portals create 0.0.0.0 3260
-
-# Configure LUNs
-for i in "${!LUNS[@]}"; do
-  LUN_PATH="${LUNS[$i]}"
-  targetcli /backstores/block create "lun$i" "$LUN_PATH"
-  targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/lun$i"
-done
-
-# Disable authentication
-targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
-targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
-
-echo "Global target configured: $IQN with ${#LUNS[@]} LUNs"
-targetcli /iscsi ls
-
-# Keep running (sleep infinity allows proper signal handling)
-sleep infinity & wait
-EOF
-
-read -r -d '' STS_ZONAL_SCRIPT <<'EOF' || true
-#!/bin/bash
-set -euo pipefail
-
-echo "Starting sanim zonal target..."
-
-# Load kernel modules and mount configfs
-modprobe target_core_mod || true
-modprobe iscsi_target_mod || true
-mount -t configfs none /sys/kernel/config || true
-
-targetcli clearconfig confirm=true
-
-# Get zone from downward API
-ZONE="${POD_ZONE}"
-
-# Discover LUNs
-LUNS=($(ls /dev/${DEVICE_PREFIX}-* 2>/dev/null | sort -V || true))
-if [ ${#LUNS[@]} -eq 0 ]; then
-  echo "Error: No LUNs found matching /dev/${DEVICE_PREFIX}-*"
-  exit 1
-fi
-
-# Validate LUN count matches expected
-EXPECTED_COUNT=${ZONAL_DISK_COUNT}
-if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
-  echo "Warning: Found ${#LUNS[@]} LUNs but expected $EXPECTED_COUNT"
-  echo "Discovered LUNs: ${LUNS[@]}"
-fi
-
-# Create iSCSI target with zone suffix
-IQN="${IQN_PREFIX}:zone-${ZONE}"
-targetcli /iscsi create "$IQN"
-targetcli /iscsi/$IQN/tpg1/portals delete 0.0.0.0 3260
-targetcli /iscsi/$IQN/tpg1/portals create 0.0.0.0 3260
-
-# Configure LUNs
-for i in "${!LUNS[@]}"; do
-  LUN_PATH="${LUNS[$i]}"
-  targetcli /backstores/block create "lun$i" "$LUN_PATH"
-  targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/lun$i"
-done
-
-# Disable authentication
-targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
-targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
-
-echo "Zonal target configured: $IQN with ${#LUNS[@]} LUNs"
-targetcli /iscsi ls
-
-# Keep running (sleep infinity allows proper signal handling)
-sleep infinity & wait
-EOF
-
-read -r -d '' DS_INIT_SCRIPT <<'EOF' || true
-#!/bin/bash
-set -euo pipefail
-
-echo "Starting sanim initiator..."
-
-# Trap for cleanup
-cleanup() {
-  if [ "${FORCE_CLEANUP}" == "true" ]; then
-    echo "Signal received, logging out from all sessions..."
-    iscsiadm --mode node --logoutall=all || true
-  else
-    echo "Signal received, keeping sessions active (FORCE_CLEANUP=false)"
-  fi
-}
-trap cleanup SIGTERM SIGINT
-
-# Ensure host initiator name is used (avoid container's initiatorname.iscsi)
-if [ -f /etc/iscsi/initiatorname.iscsi ]; then
-  echo "Using host initiator name: $(cat /etc/iscsi/initiatorname.iscsi)"
-fi
-
-# Get local zone from downward API
-LOCAL_ZONE="${NODE_ZONE}"
-
-# Login to global target if enabled
-if [ "${INSTALL_GLOBAL}" == "true" ]; then
-  GLOBAL_IQN="${IQN_PREFIX}:global"
-  GLOBAL_SVC="global-service.${NAMESPACE}.svc.cluster.local"
-  
-  echo "Waiting for global target portal to be ready..."
-  for attempt in {1..10}; do
-    if timeout 1 bash -c "cat < /dev/tcp/${GLOBAL_SVC}/3260" 2>/dev/null; then
-      echo "Portal is listening on attempt $attempt"
-      break
-    fi
-    echo "Portal not ready, attempt $attempt/10..."
-    sleep 3
-  done
-  
-  echo "Discovering global target at $GLOBAL_SVC..."
-  for attempt in {1..5}; do
-    if iscsiadm --mode discovery --type sendtargets --portal "$GLOBAL_SVC" 2>/dev/null; then
-      echo "Discovery successful on attempt $attempt"
-      break
-    fi
-    echo "Discovery attempt $attempt failed, retrying..."
-    sleep 2
-  done
-  
-  echo "Logging into global target $GLOBAL_IQN..."
-  for attempt in {1..5}; do
-    if iscsiadm --mode node --targetname "$GLOBAL_IQN" --portal "$GLOBAL_SVC" --login 2>/dev/null; then
-      echo "Login successful on attempt $attempt"
-      break
-    fi
-    echo "Login attempt $attempt failed, retrying..."
-    sleep 2
-  done
-fi
-
-# Login to zonal target if enabled
-if [ "${INSTALL_ZONAL}" == "true" ]; then
-  LOCAL_ZONE_IQN="${IQN_PREFIX}:zone-${LOCAL_ZONE}"
-  ZONAL_SVC="zonal-service.${NAMESPACE}.svc.cluster.local"
-  
-  echo "Discovering zonal targets at $ZONAL_SVC..."
-  IPS=$(getent hosts "$ZONAL_SVC" | awk '{print $1}')
-  
-  for IP in $IPS; do
-    echo "Checking portal $IP for zone $LOCAL_ZONE..."
-    
-    # Pre-check: ensure portal is listening before discovery
-    PORTAL_READY=false
-    for check in {1..5}; do
-      if timeout 1 bash -c "cat < /dev/tcp/${IP}/3260" 2>/dev/null; then
-        PORTAL_READY=true
-        break
-      fi
-      sleep 1
-    done
-    
-    if [ "$PORTAL_READY" = false ]; then
-      echo "Portal $IP not listening on port 3260, skipping..."
-      continue
-    fi
-    
-    # Use || true to continue if this portal is unready
-    if iscsiadm --mode discovery --type sendtargets --portal "$IP" 2>/dev/null | grep -q "$LOCAL_ZONE_IQN"; then
-      echo "Found matching zone target at $IP, logging in..."
-      for attempt in {1..5}; do
-        if iscsiadm --mode node --targetname "$LOCAL_ZONE_IQN" --portal "$IP" --login 2>/dev/null; then
-          echo "Login successful on attempt $attempt"
-          break 2
-        fi
-        echo "Login attempt $attempt failed, retrying..."
-        sleep 2
-      done
-    else
-      echo "Portal $IP ready but no matching zone, trying next..."
-    fi
-  done
-fi
-
-echo "iSCSI sessions active:"
-iscsiadm --mode session || echo "No active sessions"
-
-echo "Block devices:"
-lsblk
-
-# Keep running (sleep infinity allows proper signal handling)
-sleep infinity & wait
-EOF
 
 # Start generating resources.yaml
 cat > resources.yaml <<YAML
@@ -309,7 +127,7 @@ $(echo "$DS_INIT_SCRIPT" | sed 's/^/    /')
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: default
+  name: sanim
   namespace: ${NAMESPACE}
 
 #, Custom SecurityContextConstraints for privileged operations
@@ -341,7 +159,7 @@ seLinuxContext:
 supplementalGroups:
   type: RunAsAny
 users:
-- system:serviceaccount:${NAMESPACE}:default
+- system:serviceaccount:${NAMESPACE}:sanim
 volumes:
 - '*'
 
@@ -376,7 +194,7 @@ spec:
         app.kubernetes.io/component: target
         sanim.io/type: global
     spec:
-      serviceAccountName: default
+      serviceAccountName: sanim
       automountServiceAccountToken: false
       nodeSelector:
         topology.kubernetes.io/zone: ${GLOBAL_ZONE}
@@ -385,31 +203,33 @@ spec:
         image: ${IMAGE}
         command: ["/bin/bash", "/scripts/sts-global.sh"]
         env:
-        - name: DEVICE_PREFIX
-          value: "${DEVICE_PREFIX}"
         - name: IQN_PREFIX
           value: "${IQN_PREFIX}"
+        - name: GLOBAL_DISK_COUNT
+          value: "${GLOBAL_DISK_COUNT}"
         securityContext:
           privileged: true
         volumeMounts:
         - name: scripts
           mountPath: /scripts
-        - name: dev
-          mountPath: /dev
-          mountPropagation: HostToContainer
         - name: lib-modules
           mountPath: /lib/modules
           readOnly: true
         - name: target-config
           mountPath: /etc/target
+        - name: dbus
+          mountPath: /var/run/dbus
+          readOnly: true
+        - name: sys-kernel-config
+          mountPath: /sys/kernel/config
         volumeDevices:
 YAML
 
   # Generate volumeDevices for strict LUN mapping
   for i in $(seq 0 $((GLOBAL_DISK_COUNT - 1))); do
     cat >> resources.yaml <<YAML
-        - name: ${DEVICE_PREFIX}-$i
-          devicePath: /dev/${DEVICE_PREFIX}-$i
+        - name: global-$i
+          devicePath: /dev/global-$i
 YAML
   done
 
@@ -427,14 +247,17 @@ YAML
         configMap:
           name: scripts
           defaultMode: 0755
-      - name: dev
-        hostPath:
-          path: /dev
       - name: lib-modules
         hostPath:
           path: /lib/modules
       - name: target-config
         emptyDir: {}
+      - name: dbus
+        hostPath:
+          path: /var/run/dbus
+      - name: sys-kernel-config
+        hostPath:
+          path: /sys/kernel/config
   volumeClaimTemplates:
 YAML
 
@@ -442,7 +265,7 @@ YAML
 for i in $(seq 0 $((GLOBAL_DISK_COUNT - 1))); do
     cat >> resources.yaml <<YAML
   - metadata:
-      name: ${DEVICE_PREFIX}-$i
+      name: global-$i
     spec:
       accessModes: ["ReadWriteOnce"]
       storageClassName: ${STORAGE_CLASS}
@@ -496,7 +319,7 @@ metadata:
     sanim.io/type: zonal
 spec:
   serviceName: zonal-service
-  replicas: 3
+  replicas: ${UNIQUE_ZONE_COUNT}
   selector:
     matchLabels:
       app.kubernetes.io/name: sanim
@@ -509,42 +332,56 @@ spec:
         app.kubernetes.io/component: target
         sanim.io/type: zonal
     spec:
-      serviceAccountName: default
+      serviceAccountName: sanim
       automountServiceAccountToken: false
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: sanim
+            app.kubernetes.io/component: target
+            sanim.io/type: zonal
       containers:
       - name: target
         image: ${IMAGE}
         command: ["/bin/bash", "/scripts/sts-zonal.sh"]
         env:
-        - name: DEVICE_PREFIX
-          value: "${DEVICE_PREFIX}"
         - name: IQN_PREFIX
           value: "${IQN_PREFIX}"
-        - name: POD_ZONE
+        - name: ZONAL_DISK_COUNT
+          value: "${ZONAL_DISK_COUNT}"
+        - name: NODE_IP
           valueFrom:
             fieldRef:
-              fieldPath: metadata.labels['topology.kubernetes.io/zone']
+              fieldPath: status.hostIP
         securityContext:
           privileged: true
         volumeMounts:
         - name: scripts
           mountPath: /scripts
-        - name: dev
-          mountPath: /dev
-          mountPropagation: HostToContainer
         - name: lib-modules
           mountPath: /lib/modules
           readOnly: true
         - name: target-config
           mountPath: /etc/target
+        - name: dbus
+          mountPath: /var/run/dbus
+          readOnly: true
+        - name: sys-kernel-config
+          mountPath: /sys/kernel/config
+        - name: zone-map
+          mountPath: /etc/zone-map
+          readOnly: true
         volumeDevices:
 YAML
 
   # Generate volumeDevices for strict LUN mapping
   for i in $(seq 0 $((ZONAL_DISK_COUNT - 1))); do
     cat >> resources.yaml <<YAML
-        - name: ${DEVICE_PREFIX}-$i
-          devicePath: /dev/${DEVICE_PREFIX}-$i
+        - name: zonal-$i
+          devicePath: /dev/zonal-$i
 YAML
   done
 
@@ -562,14 +399,20 @@ YAML
         configMap:
           name: scripts
           defaultMode: 0755
-      - name: dev
-        hostPath:
-          path: /dev
       - name: lib-modules
         hostPath:
           path: /lib/modules
       - name: target-config
         emptyDir: {}
+      - name: dbus
+        hostPath:
+          path: /var/run/dbus
+      - name: sys-kernel-config
+        hostPath:
+          path: /sys/kernel/config
+      - name: zone-map
+        configMap:
+          name: node-zone-map
   volumeClaimTemplates:
 YAML
 
@@ -577,7 +420,7 @@ YAML
 for i in $(seq 0 $((ZONAL_DISK_COUNT - 1))); do
     cat >> resources.yaml <<YAML
   - metadata:
-      name: ${DEVICE_PREFIX}-$i
+      name: zonal-$i
     spec:
       accessModes: ["ReadWriteOnce"]
       storageClassName: ${STORAGE_CLASS}
@@ -638,10 +481,11 @@ spec:
         app.kubernetes.io/name: sanim
         app.kubernetes.io/component: initiator
     spec:
-      serviceAccountName: default
+      serviceAccountName: sanim
       automountServiceAccountToken: false
       hostNetwork: true
       hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
 YAML
 
 # Add nodeSelector if NODE_LABEL_FILTER is set
@@ -670,24 +514,29 @@ cat >> resources.yaml <<YAML
           value: "${INSTALL_ZONAL}"
         - name: FORCE_CLEANUP
           value: "${FORCE_CLEANUP}"
-        - name: NODE_ZONE
+        - name: NODE_IP
           valueFrom:
             fieldRef:
-              fieldPath: metadata.labels['topology.kubernetes.io/zone']
+              fieldPath: status.hostIP
         securityContext:
           privileged: true
+        terminationMessagePath: /tmp/termination-log
+        terminationMessagePolicy: File
         volumeMounts:
         - name: scripts
           mountPath: /scripts
         - name: dev
           mountPath: /dev
-          mountPropagation: Bidirectional
+          mountPropagation: HostToContainer
         - name: iscsi-config
           mountPath: /etc/iscsi
-          mountPropagation: Bidirectional
+          mountPropagation: HostToContainer
         - name: iscsi-lib
           mountPath: /var/lib/iscsi
-          mountPropagation: Bidirectional
+          mountPropagation: HostToContainer
+        - name: zone-map
+          mountPath: /etc/zone-map
+          readOnly: true
       volumes:
       - name: scripts
         configMap:
@@ -702,7 +551,10 @@ cat >> resources.yaml <<YAML
       - name: iscsi-lib
         hostPath:
           path: /var/lib/iscsi
+      - name: zone-map
+        configMap:
+          name: node-zone-map
 YAML
 
 echo "Generated resources.yaml successfully!"
-echo "Deploy with: oc apply -f resources.yaml"
+echo "Deploy with: oc apply -f resources.yaml --server-side --force-conflicts"
