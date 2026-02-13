@@ -9,7 +9,27 @@ I wanted an in-cluster solution to simulate SAN without a dedicated storage arra
 
 The core idea remained the same throughout, support a shared-storage (global target) and shared-nothing (zonal target) configurations where the former allows initiator from all zones to login and the latter restricts login to the target in its zone. Statefulset for target is chosen to forgo manual management of PVCs and get DNS resolvable headless service, a simple Daemonset for initiator and a ConfigMap with entrypoint scripts for all the pods.
 
-Everything else follows implementing above idea and bringing it to a workable state, please note even though care is taken to be coherent this is AI generated (partially reviewed so far!) covering multiple cases. The same procedure should work for exporting your LVM disks as well as iSCSI! See [Cleanup](#cleanup) for teardown.
+Everything else follows implementing above idea and bringing it to a workable state, please note even though care is taken to be coherent this is AI generated (partially reviewed so far!) covering multiple cases. The same procedure should work for exporting your LVM disks as well as iSCSI!
+
+`./generate.sh -m` does a survey of zones to node mapping, uses `oc` (a network call). `./generate.sh` uses the zonal info but doesn't do any network calls. Nevertheless, the idea is for you to look at all the generated resources before applying them, the generated files are `zones.txt`, `resources.yaml` and `node-zone-map.yaml`. See [Cleanup](#cleanup) for teardown.
+
+```
+> grep '^#,' *yaml -n
+node-zone-map.yaml:1:#, Namespace for sanim resources
+node-zone-map.yaml:10:#, ConfigMap for node-to-zone mapping
+resources.yaml:1:#, Namespace for sanim resources
+resources.yaml:10:#, ConfigMap containing entrypoint scripts
+resources.yaml:353:#, ServiceAccount for sanim pods
+resources.yaml:361:#, SecurityContextConstraints for iSCSI targets
+resources.yaml:399:#, SecurityContextConstraints for iSCSI initiators
+resources.yaml:434:#, ServiceAccount for iSCSI targets
+resources.yaml:442:#, ServiceAccount for iSCSI initiators
+resources.yaml:450:#, StatefulSet for global shared iSCSI target
+resources.yaml:556:#, Headless Service for global target (provides stable pod DNS)
+resources.yaml:579:#, StatefulSet for zone us-east-1d
+resources.yaml:685:#, Headless Service for zone us-east-1d
+resources.yaml:710:#, DaemonSet for iSCSI initiators (dumb controller)
+```
 
 ## AI Generated
 
@@ -75,18 +95,7 @@ Port binding happens at host kernel level, not per-IQN. If global and zonal targ
 
 ## Usage
 
-### 1. Generate Zone Map
-
-Query cluster for node-to-zone mapping (requires oc):
-
-```bash
-bash generate.sh -m
-oc apply -f node-zone-map.yaml --server-side --force-conflicts
-```
-
-This creates `zones.txt` and `node-zone-map.yaml`.
-
-### 2. Configure
+### 1. Configure
 
 Edit `config.env`:
 
@@ -103,7 +112,18 @@ IMAGE=ghcr.io/leelavg/sanim:latest
 NODE_LABEL_FILTER=node-role.kubernetes.io/worker=
 ```
 
-**Hardcoded:** IQN=`iqn.2020-05.com.thoughtexpo:storage`, device prefixes=`global-*/zonal-*`, ports=3260/3261
+**Hardcoded:** IQN=`iqn.2020-05.com.thoughtexpo:storage`, device prefixes=`global-*/zonal-*`, ports=`3260/3261`
+
+### 2. Generate Zone Map
+
+Query cluster for node-to-zone mapping (requires oc):
+
+```bash
+bash generate.sh -m
+oc apply -f node-zone-map.yaml --server-side --force-conflicts
+```
+
+This creates `zones.txt` and `node-zone-map.yaml`.
 
 ### 3. Generate and Deploy
 
@@ -251,7 +271,7 @@ done
 # 3. Remove SELinux port 3261 configuration from nodes with matching label filter
 for node in $(oc get nodes -l "$(grep NODE_LABEL_FILTER config.env | cut -d= -f2)" -o name | cut -d/ -f2); do
   echo "Removing SELinux config on $node..."
-  oc debug node/$node -q -ndefault -- chroot /host semanage port -d -t iscsi_port_t -p tcp 3261 2>/dev/null || true
+  oc debug node/$node -q -ndefault -- chroot /host /usr/sbin/semanage port -d -t iscsi_port_t -p tcp 3261 2>/dev/null || true
 done
 
 # 4. Delete all remaining resources
@@ -362,7 +382,7 @@ Next steps:
 
 ## License
 
-MIT
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
@@ -372,3 +392,4 @@ Contributions welcome! Please ensure:
 - Test with both global and zonal configurations
 - Update documentation for new features
 - Scripts in `scripts/` directory maintain full IDE syntax highlighting
+

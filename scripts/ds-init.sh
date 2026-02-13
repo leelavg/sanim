@@ -8,7 +8,7 @@ echo "Starting sanim initiator..."
 # SELinux only permits port 3260 by default; port 3261 must be explicitly added
 # Note: DaemonSet runs on ALL nodes, so this configures both initiator and target nodes
 echo "Configuring SELinux for iSCSI port 3261..."
-nsenter -t 1 -m -u -i semanage port -a -t iscsi_port_t -p tcp 3261 2>/dev/null || true
+nsenter -t 1 -m -u -i /usr/sbin/semanage port -a -t iscsi_port_t -p tcp 3261 2>/dev/null || true
 
 # Use host's iscsiadm via nsenter (Fedora 43 iscsiadm incompatible with RHEL CoreOS kernel)
 # Note: nsenter uses host's mount namespace, so DNS resolution must happen before nsenter
