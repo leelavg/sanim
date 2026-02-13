@@ -31,8 +31,7 @@ ZONAL_DISK_COUNT="${ZONAL_DISK_COUNT:-1}"
 ZONAL_DISK_SIZE="${ZONAL_DISK_SIZE:-10Gi}"
 STORAGE_CLASS="${STORAGE_CLASS:-gp3-csi}"
 IMAGE="${IMAGE:-ghcr.io/leelavg/sanim:latest}"
-NODE_LABEL_FILTER="${NODE_LABEL_FILTER:-sanim-node=true}"
-FORCE_CLEANUP="${FORCE_CLEANUP:-false}"
+NODE_LABEL_FILTER="${NODE_LABEL_FILTER:-node-role.kubernetes.io/worker=}"
 IQN_PREFIX="iqn.2020-05.com.thoughtexpo:storage"
 
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")/scripts"
@@ -604,8 +603,6 @@ cat >> resources.yaml <<YAML
           value: "${INSTALL_GLOBAL}"
         - name: INSTALL_ZONAL
           value: "${INSTALL_ZONAL}"
-        - name: FORCE_CLEANUP
-          value: "${FORCE_CLEANUP}"
         - name: NODE_IP
           valueFrom:
             fieldRef:

@@ -3,6 +3,9 @@ set -euo pipefail
 
 echo "Starting sanim zonal target..."
 
+# SELinux configuration happens via initiator DaemonSet (runs on all nodes)
+# No need for hostPID on targets - DaemonSet handles it
+
 # Mount configfs FIRST, then load modules
 mount -t configfs none /sys/kernel/config 2>/dev/null || true
 
@@ -53,9 +56,12 @@ fi
 IQN="${IQN_PREFIX}:${ZONE}"
 targetcli /iscsi create "$IQN"
 
+# Disable TPG before modifying portals (TPG is auto-enabled on creation)
+targetcli /iscsi/$IQN/tpg1 disable
+
 # Delete default portal and create on port 3261 to avoid conflict with global (port 3260)
 targetcli /iscsi/$IQN/tpg1/portals delete ::0 3260 2>/dev/null || true
-targetcli /iscsi/$IQN/tpg1/portals create ::0 3261
+targetcli /iscsi/$IQN/tpg1/portals create 0.0.0.0 3261
 
 # Enable the TPG (this starts the listener)
 targetcli /iscsi/$IQN/tpg1 enable

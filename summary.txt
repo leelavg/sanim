@@ -28,6 +28,9 @@ Key Architecture Decisions:
 Critical Fixes (Live Testing):
 - Portal listener bug: Removed clearconfig/restoreconfig cycle that stopped kernel listener
 - Port binding conflict: Global uses 3260, zonal uses 3261 (binding is per-host-kernel, not per-IQN)
+- SELinux port blocking: Port 3261 requires explicit addition to iscsi_port_t policy (Red Hat Solution 5170611)
+- SELinux auto-config: DaemonSet configures all nodes via nsenter/semanage on startup
+- TPG portal changes: Must disable TPG before modifying portals, then re-enable
 - Session auto-recovery: Monitor loop checks sysfs every 10s, reconnects on failure
 - Zonal login simplified: Connects only to own zone (no multi-zone sweep)
 - Startup cleanup: Only login if no healthy session exists (prevents stale session accumulation)
@@ -41,7 +44,6 @@ Configuration (config.env):
 - STORAGE_CLASS: Must support volumeMode: Block (default: gp3-csi)
 - NODE_LABEL_FILTER: Node selector for initiators (default: node-role.kubernetes.io/worker=)
 - IMAGE: Container image path
-- FORCE_CLEANUP: Session logout on pod termination (default: false)
 
 Hardcoded (not configurable):
 - IQN: iqn.2020-05.com.thoughtexpo:storage (domain registration date)
@@ -51,7 +53,6 @@ Hardcoded (not configurable):
 Zone Management:
 - Run 'generate.sh -m' first - queries cluster nodes, writes zones.txt + node-zone-map.yaml
 - Then 'generate.sh' - reads zones.txt offline, auto-selects first zone for global target
-- No GLOBAL_ZONE or UNIQUE_ZONE_COUNT needed in config.env
 
 Deployment Flow:
 1. Survey cluster: oc get nodes --show-labels
@@ -60,16 +61,25 @@ Deployment Flow:
 4. Edit config.env with disk sizes and node filter
 5. Generate resources: bash generate.sh (reads zones.txt offline)
 6. Deploy: oc apply -f resources.yaml --server-side --force-conflicts
-7. Validate: bash validate.sh (checks kernel sessions)
+7. Validate: bash scripts/validate.sh (checks kernel sessions)
+
+Cleanup Flow:
+1. Delete DaemonSet: oc delete daemonset initiator -n sanim-system
+2. Logout sessions on labeled nodes via oc debug
+3. Remove SELinux port 3261 on labeled nodes via oc debug
+4. Delete resources: oc delete -f resources.yaml --ignore-not-found=true
+See README.md for complete commands with label filter extraction from config.env
 
 Key Files:
 - generate.sh: Main generator with -m flag for zone mapping
 - scripts/sts-global.sh: Global target entrypoint (port 3260)
-- scripts/sts-zonal.sh: Zonal target entrypoint (port 3261)
-- scripts/ds-init.sh: Initiator with generic health check and login functions
+- scripts/sts-zonal.sh: Zonal target entrypoint (port 3261, TPG disable/enable sequence)
+- scripts/ds-init.sh: Initiator with SELinux auto-config and session health monitoring
+- scripts/validate.sh: Validation script for sessions and block devices
 - config.env: User configuration
 - Containerfile: Fedora 43 with targetcli and debug tools
 - resources.yaml: Generated K8s resources (Namespace, ConfigMaps, SCCs, SAs, STSs, Services, DS)
+- README.md: Includes deployment flow and proper cleanup sequence
 
 IQN and Device Naming:
 - Global IQN: iqn.2020-05.com.thoughtexpo:storage:global
@@ -89,11 +99,12 @@ Target Flow (sts-global.sh, sts-zonal.sh):
 - No CHAP authentication
 
 Initiator Flow (ds-init.sh):
+- Configure SELinux: Add port 3261 to iscsi_port_t via nsenter/semanage (runs on ALL nodes)
 - Use nsenter to run host's iscsiadm (Fedora 43 compatibility)
 - Check for existing healthy sessions via sysfs (skip login if found)
 - Discover targets via headless Service DNS
 - Login with aggressive timeouts (noop_out_timeout=5s, replacement_timeout=15s)
-- Monitor loop: check sysfs every 10s, reconnect on failure
+- Monitor loop: check sysfs every 10s with interruptible wait, reconnect on failure
 - Zonal: Only connect to own zone target (uses node-zone-map)
 - Sessions persist in host kernel across pod restarts
 - Mounts: /dev, /etc/iscsi, /var/lib/iscsi (HostToContainer propagation)
@@ -104,7 +115,7 @@ Security:
 - automountServiceAccountToken: false (no K8s API access needed)
 - Requires cluster admin for SCC creation
 
-Multipath Configuration:
+Multipath Configuration (not tested):
 Add to /etc/multipath.conf on worker nodes:
 ```
 blacklist {

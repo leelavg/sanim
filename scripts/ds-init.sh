@@ -3,6 +3,13 @@ set -euo pipefail
 
 echo "Starting sanim initiator..."
 
+# Configure SELinux to allow iSCSI on port 3261 (for zonal targets)
+# Red Hat Solution: https://access.redhat.com/solutions/5170611
+# SELinux only permits port 3260 by default; port 3261 must be explicitly added
+# Note: DaemonSet runs on ALL nodes, so this configures both initiator and target nodes
+echo "Configuring SELinux for iSCSI port 3261..."
+nsenter -t 1 -m -u -i semanage port -a -t iscsi_port_t -p tcp 3261 2>/dev/null || true
+
 # Use host's iscsiadm via nsenter (Fedora 43 iscsiadm incompatible with RHEL CoreOS kernel)
 # Note: nsenter uses host's mount namespace, so DNS resolution must happen before nsenter
 ISCSIADM="nsenter -t 1 -m -u -i /usr/sbin/iscsiadm"
@@ -67,16 +74,8 @@ discover_and_login() {
   return 1
 }
 
-# Trap for cleanup
-cleanup() {
-  if [ "${FORCE_CLEANUP}" == "true" ]; then
-    echo "Signal received, logging out from all sessions..."
-    $ISCSIADM --mode node --logoutall=all || true
-  else
-    echo "Signal received, keeping sessions active (FORCE_CLEANUP=false)"
-  fi
-}
-trap cleanup SIGTERM SIGINT
+# Session cleanup: Sessions persist in host kernel across pod restarts
+# For cleanup, use the cleanup.sh script which handles both resources and sessions
 
 # Ensure host initiator name is used (avoid container's initiatorname.iscsi)
 if [ -f /etc/iscsi/initiatorname.iscsi ]; then
@@ -160,5 +159,6 @@ while true; do
     fi
   fi
 
-  sleep 10
+  # Use sleep with background process and wait to allow trap to interrupt
+  sleep 10 & wait $!
 done
