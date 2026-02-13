@@ -8,118 +8,72 @@ sanim enables you to quickly provision iSCSI block storage within your Kubernete
 
 ## Architecture
 
-### Components
+**Components:**
+- **STS-Global** (optional): Single-replica StatefulSet on port 3260, auto-uses first zone from zones.txt
+- **STS-Zonal** (optional): Per-zone StatefulSets on port 3261, one per zone in zones.txt
+- **DS-Initiator**: DaemonSet with sysfs-based health checks (10s interval) and auto-recovery
+- **Headless Services**: Stable pod DNS (global-0.global-service, zonal-{zone}-0.zonal-{zone}-service)
+- **ConfigMaps**: Entrypoint scripts + node-zone-map
+- **SCCs**: Separate SecurityContextConstraints for targets (hostNetwork, hostPorts) and initiators (hostPID)
 
-1. **STS-Global (Optional)**: A single-replica StatefulSet that exports LUNs cluster-wide from a specific availability zone
-2. **STS-Zonal (Optional)**: A multi-replica StatefulSet (one per zone) that exports zone-local LUNs with shared-nothing architecture
-3. **DS-Initiator**: A DaemonSet that performs iSCSI login and maintains sessions, letting the host kernel handle the data path
-4. **ConfigMap**: Contains entrypoint scripts (externalized in `scripts/` directory for IDE syntax highlighting)
-5. **SCC**: Custom SecurityContextConstraints for privileged operations
+**Key Design:**
+- Pod networking for targets (not hostNetwork) - stable DNS, no port conflicts
+- Port separation: global=3260, zonal=3261 (kernel binds at host level, not per-IQN)
+- Zone map workflow: `generate.sh -m` queries cluster once, writes zones.txt + node-zone-map.yaml
+- Session persistence: Host kernel manages iSCSI sessions, survives pod restarts
+- nsenter pattern: Run host's iscsiadm from container (Fedora 43 incompatible with RHCOS)
+- No clearconfig/restoreconfig: Prevented kernel listener thread from restarting
+- Aggressive timeouts: noop_out_timeout=5s, replacement_timeout=15s
+- Hardcoded IQN: `iqn.2020-05.com.thoughtexpo:storage` (domain registration date)
+- Hardcoded device prefixes: `global-*` and `zonal-*`
 
-### Flow
-
+**Flow:**
 ```
-User → config.env → generate.sh → resources.yaml → oc apply
-                                                      ↓
-                                    ┌─────────────────┴─────────────────┐
-                                    ↓                                   ↓
-                            STS (iSCSI Target)              DS (iSCSI Initiator)
-                            - Creates LUNs                  - Discovers targets (via nsenter)
-                            - Exports via targetcli         - Performs login (host iscsiadm)
-                            - Stable DNS via Service        - Maintains sessions
-                                                            - Host kernel handles I/O
+generate.sh -m → zones.txt + node-zone-map.yaml → oc apply node-zone-map.yaml
+config.env → generate.sh → resources.yaml → oc apply resources.yaml
+                                                ↓
+                              ┌─────────────────┴─────────────────┐
+                              ↓                                   ↓
+                      STS (Target)                        DS (Initiator)
+                      - targetcli config                  - nsenter iscsiadm
+                      - Port 3260/3261                    - Sysfs monitoring
+                      - LUNs via volumeDevices            - Host kernel sessions
 ```
-
-## Live Testing Insights
-
-sanim has been deployed and tested on a live OpenShift cluster. Key fixes applied:
-
-### Critical Fixes
-- **volumeDevices vs /dev mount**: Removed `/dev` hostPath mount from targets (conflicted with volumeDevices)
-- **DNS resolution**: Changed to `dnsPolicy: ClusterFirstWithHostNet` for hostNetwork pods
-- **iscsiadm compatibility**: Use `nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm` to run host's iscsiadm (Fedora 43 version incompatible with RHCOS kernel)
-- **Target mounts**: Added `/var/run/dbus` (ro) for targetcli and `/sys/kernel/config` for configfs
-- **Termination log path**: Set to `/tmp/termination-log` to avoid `/dev` conflicts
-
-### Semantic Improvements
-- **IQN format**: Hardcoded to `iqn.2020-05.com.thoughtexpo:storage` (reflects domain registration date)
-- **Zonal IQN**: Simplified to `iqn.2020-05.com.thoughtexpo:storage:us-west-1a` (removed redundant "zone-" prefix)
-- **Device prefixes**: Hardcoded to `global-*` and `zonal-*` (self-documenting, not configurable)
-
-### Code Quality
-- **Externalized scripts**: Scripts moved to `scripts/` directory for full IDE syntax highlighting
-- **Orphaned cleanup**: Added to zonal script (matches global robustness)
-- **Login warnings**: Clear visibility when iSCSI connections fail
-- **Mount optimization**: Changed to `HostToContainer` propagation (initiator uses nsenter)
-- **Removed unnecessary mounts**: `/var/run/dbus` and `/sys` from initiator (not needed with nsenter)
 
 ## FAQ
 
-### Why StatefulSets for targets?
+**Why StatefulSets for targets?**
+Provide stable DNS names (`global-0.global-service`), sticky PVCs across restarts, and zone affinity with `WaitForFirstConsumer`.
 
-StatefulSets provide:
-- **Stable DNS names**: Each pod gets a predictable hostname (e.g., `global-0.global-service`)
-- **Sticky PVCs**: Volumes remain bound to specific pods across restarts
-- **Zone affinity**: Combined with `WaitForFirstConsumer`, ensures PVCs stay in the correct availability zone
+**Why is the DaemonSet "dumb"?**
+It only runs `iscsiadm` login via `nsenter` - does NOT start `iscsid`. Host kernel manages sessions, so they survive pod restarts (no I/O disruption).
 
-### Why is the DaemonSet "dumb"?
+**Why use nsenter for iscsiadm?**
+Fedora 43's iscsiadm (6.2.1.11) is incompatible with RHCOS kernel. `nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm` runs the host's version.
 
-The initiator DaemonSet is intentionally simple:
-- It only performs `iscsiadm` login operations via `nsenter` to the host
-- It does NOT start `iscsid` in the container
-- The host kernel manages the actual iSCSI sessions and data path
-- **Critical benefit**: If the DS pod restarts, iSCSI sessions remain active, preventing I/O disruption
+**Why different ports for global vs zonal?**
+Port binding happens at host kernel level, not per-IQN. If global and zonal targets co-locate on same node, they'd conflict on port 3260. Solution: global=3260, zonal=3261.
 
-### How does the host-container flow work?
+**Target mounts:** volumeDevices for PVC block devices, /var/run/dbus (ro) for targetcli, /sys/kernel/config for configfs.
 
-**Target (STS)**:
-- Container runs `targetcli` to configure iSCSI targets
-- Block devices from PVCs are exposed via `volumeDevices` (not hostPath mounts)
-- `/var/run/dbus` mounted (ro) for targetcli communication
-- `/sys/kernel/config` mounted for configfs access
-
-**Initiator (DS)**:
-- Container uses `nsenter` to run host's `iscsiadm` (compatibility fix)
-- Mounts with `HostToContainer` propagation:
-  - `/dev` (see block devices)
-  - `/etc/iscsi` (configuration)
-  - `/var/lib/iscsi` (session state)
-- `iscsiadm` commands affect the **host kernel**, not the container
-- Sessions persist even if the container restarts
-
-### Why use nsenter for iscsiadm?
-
-Fedora 43's iscsiadm (version 6.2.1.11) is incompatible with RHEL CoreOS kernel. Using `nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm` runs the host's iscsiadm, ensuring compatibility.
-
-### Why avoid starting iscsid in containers?
-
-Starting `iscsid` in containers would:
-- Create session state inside the container (lost on restart)
-- Conflict with the host's iSCSI daemon
-- Break the "dumb controller" pattern
-- Cause I/O hangs during pod restarts
+**Initiator mounts:** /dev, /etc/iscsi, /var/lib/iscsi with HostToContainer propagation. Sessions persist in host kernel across container restarts.
 
 ## Usage
 
-### 1. Survey Your Cluster
+### 1. Generate Zone Map
 
-Identify node labels and availability zones:
+Query cluster for node-to-zone mapping (requires oc):
 
 ```bash
-oc get nodes --show-labels
+bash generate.sh -m
+oc apply -f node-zone-map.yaml --server-side --force-conflicts
 ```
 
-Look for `topology.kubernetes.io/zone` labels (e.g., `us-east-1a`, `us-east-1b`, `us-east-1c`).
+This creates `zones.txt` and `node-zone-map.yaml`.
 
 ### 2. Configure
 
-Create or edit `config.env`:
-
-```bash
-cp config.env.example config.env
-```
-
-Example configuration:
+Edit `config.env`:
 
 ```bash
 NAMESPACE=sanim-system
@@ -127,7 +81,6 @@ INSTALL_GLOBAL=true
 INSTALL_ZONAL=true
 GLOBAL_DISK_COUNT=2
 GLOBAL_DISK_SIZE=10Gi
-GLOBAL_ZONE=us-east-1a
 ZONAL_DISK_COUNT=1
 ZONAL_DISK_SIZE=10Gi
 STORAGE_CLASS=gp3-csi
@@ -135,47 +88,26 @@ IMAGE=ghcr.io/leelavg/sanim:latest
 NODE_LABEL_FILTER=node-role.kubernetes.io/worker=
 ```
 
-**Note**: IQN and device prefixes are now hardcoded:
-- IQN: `iqn.2020-05.com.thoughtexpo:storage`
-- Device prefixes: `global-*` for shared-storage, `zonal-*` for shared-nothing
+**Hardcoded:** IQN=`iqn.2020-05.com.thoughtexpo:storage`, device prefixes=`global-*/zonal-*`, ports=3260/3261
 
-### 3. Generate Resources
+### 3. Generate and Deploy
 
 ```bash
-bash generate.sh
+bash generate.sh  # Reads zones.txt offline, auto-selects first zone for global
+oc apply -f resources.yaml --server-side --force-conflicts
 ```
 
-This creates `resources.yaml` with all necessary Kubernetes resources.
-
-### 4. Deploy
+### 4. Verify
 
 ```bash
-oc apply -f resources.yaml
-```
+# Check components
+oc get sts,ds,pods -n sanim-system
 
-### 5. Verify
-
-Check that all components are running:
-
-```bash
-# Check targets
-oc get sts -n sanim-system
-oc get pods -n sanim-system -l app.kubernetes.io/component=target
-
-# Check initiators
-oc get ds -n sanim-system
-oc get pods -n sanim-system -l app.kubernetes.io/component=initiator
-
-# Verify iSCSI sessions (from any initiator pod using nsenter)
+# Verify iSCSI sessions on host kernel
 oc exec -n sanim-system <initiator-pod> -- nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode session
-```
 
-### 6. Inspect Resources
-
-List all generated resources:
-
-```bash
-grep '^#,' resources.yaml
+# Inspect all generated resources
+grep '^#,' *.yaml
 ```
 
 ## Configuration Reference
@@ -183,21 +115,20 @@ grep '^#,' resources.yaml
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NAMESPACE` | `sanim-system` | Namespace for all resources |
-| `INSTALL_GLOBAL` | `false` | Enable global shared target |
-| `INSTALL_ZONAL` | `false` | Enable zonal shared-nothing targets |
+| `INSTALL_GLOBAL` | `false` | Enable global shared target (uses first zone from zones.txt) |
+| `INSTALL_ZONAL` | `false` | Enable zonal shared-nothing targets (one per zone in zones.txt) |
 | `GLOBAL_DISK_COUNT` | `2` | Number of LUNs for global target |
 | `GLOBAL_DISK_SIZE` | `10Gi` | Size of each global LUN |
-| `GLOBAL_ZONE` | - | Zone for global target (required if `INSTALL_GLOBAL=true`) |
 | `ZONAL_DISK_COUNT` | `1` | Number of LUNs per zonal target |
 | `ZONAL_DISK_SIZE` | `10Gi` | Size of each zonal LUN |
-| `STORAGE_CLASS` | `gp3-csi` | StorageClass for PVCs |
+| `STORAGE_CLASS` | `gp3-csi` | StorageClass (must support volumeMode: Block) |
 | `IMAGE` | `ghcr.io/leelavg/sanim:latest` | Container image |
 | `NODE_LABEL_FILTER` | `node-role.kubernetes.io/worker=` | Node selector for initiators |
 | `FORCE_CLEANUP` | `false` | Logout sessions on pod termination |
 
-**Hardcoded values** (not configurable):
-- IQN prefix: `iqn.2020-05.com.thoughtexpo:storage`
-- Device prefixes: `global` and `zonal`
+**Hardcoded:** IQN=`iqn.2020-05.com.thoughtexpo:storage`, devices=`global-*/zonal-*`, ports=3260/3261
+
+**Zone management:** Run `generate.sh -m` first to create zones.txt (offline, no network calls during generation)
 
 ## Building the Container Image
 
@@ -213,105 +144,57 @@ The container includes:
 
 ## iSCSI Concepts
 
-### IQN (iSCSI Qualified Name)
-
-Format: `iqn.YYYY-MM.reverse.domain:identifier`
-
-sanim uses:
+**IQN Format:** `iqn.YYYY-MM.reverse.domain:identifier`
 - Global: `iqn.2020-05.com.thoughtexpo:storage:global`
-- Zonal: `iqn.2020-05.com.thoughtexpo:storage:us-west-1a` (example)
+- Zonal: `iqn.2020-05.com.thoughtexpo:storage:us-west-2b` (example)
+- Initiator: `iqn.1994-05.com.redhat:{node}` (host)
 
-### Target vs Initiator
+**Target vs Initiator:**
+- Target: STS pods export storage via targetcli
+- Initiator: DS pods consume storage via host's iscsiadm
 
-- **Target**: The server that exports storage (STS pods)
-- **Initiator**: The client that consumes storage (DS pods using host's iscsiadm)
+**Key Commands (via nsenter):**
+```bash
+# Discover targets
+nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode discovery --type sendtargets --portal <DNS>
 
-### Discovery and Login
+# Login
+nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode node --targetname <IQN> --portal <DNS> --login
 
-1. **Discovery**: Find available targets
-   ```bash
-   nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode discovery --type sendtargets --portal <DNS>
-   ```
-
-2. **Login**: Establish a session
-   ```bash
-   nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode node --targetname <IQN> --portal <DNS> --login
-   ```
-
-3. **Session**: Active connection between initiator and target
-   ```bash
-   nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode session
-   ```
+# View sessions
+nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode session
+```
 
 ## Troubleshooting
 
-### No LUNs found in target pod
-
-Check that PVCs are bound:
+**No LUNs in target:**
 ```bash
-oc get pvc -n sanim-system
-```
-
-Verify block devices are visible via volumeDevices:
-```bash
+oc get pvc -n sanim-system  # Check PVCs bound
 oc exec -n sanim-system <target-pod> -- ls -la /dev/global-* /dev/zonal-*
 ```
 
-### Initiator cannot discover targets
-
-Check service DNS resolution:
+**Discovery failures:**
 ```bash
 oc exec -n sanim-system <initiator-pod> -- getent hosts global-service.sanim-system.svc.cluster.local
-```
-
-Verify target is listening:
-```bash
 oc exec -n sanim-system <target-pod> -- targetcli /iscsi ls
 ```
 
-### Sessions not persisting
+**Sessions not persisting:** Set `FORCE_CLEANUP=false`. Sessions survive pod restarts (host kernel manages them).
 
-Ensure `FORCE_CLEANUP=false` in config.env. Sessions should survive pod restarts because they're managed by the host kernel.
-
-### iscsiadm version mismatch
-
-If you see errors about incompatible iscsiadm versions, ensure the initiator is using `nsenter` to run the host's iscsiadm:
+**Kernel logs (critical for login failures):**
 ```bash
-oc exec -n sanim-system <initiator-pod> -- nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --version
-```
+# From node
+oc debug node/<node> → chroot /host → dmesg | grep -i iscsi
 
-### Kernel-level iSCSI troubleshooting
-
-iSCSI login failures, CHAP mismatches, or session errors are often only visible in the host kernel logs. To view them:
-
-**From initiator pod (if /dev/kmsg is accessible):**
-```bash
+# From pod (if /dev/kmsg accessible)
 oc exec -n sanim-system <initiator-pod> -- cat /dev/kmsg | grep -i iscsi
 ```
 
-**From the host node directly:**
-```bash
-oc debug node/<node-name>
-chroot /host
-dmesg | grep -i iscsi
-journalctl -k | grep -i iscsi
-```
+Common errors: `detected conn error` (network), `session recovery timed out` (target unreachable), `Login failed` (config issue)
 
-Common kernel messages to look for:
-- `connection1:0: detected conn error` - Network/portal issues
-- `session recovery timed out` - Target unreachable
-- `Login failed` - Authentication or target configuration issues
+**Zone mismatch:** `oc get pods -n sanim-system -o custom-columns=NAME:.metadata.name,ZONE:.metadata.labels.'topology\.kubernetes\.io/zone'`
 
-### Zone mismatch for zonal targets
-
-Verify pod zone labels:
-```bash
-oc get pods -n sanim-system -o custom-columns=NAME:.metadata.name,ZONE:.metadata.labels.'topology\.kubernetes\.io/zone'
-```
-
-### DNS resolution issues with hostNetwork
-
-If initiators can't resolve cluster DNS, verify `dnsPolicy: ClusterFirstWithHostNet` is set. This is critical for pods using `hostNetwork: true`.
+**DNS issues:** Verify `dnsPolicy: ClusterFirstWithHostNet` for hostNetwork pods
 
 ## Security Considerations
 
@@ -322,17 +205,9 @@ If initiators can't resolve cluster DNS, verify `dnsPolicy: ClusterFirstWithHost
 
 ## Multipath Configuration
 
-On OpenShift/RHCOS nodes with multipathd active, you must blacklist sanim devices to prevent the host from managing them:
+On OpenShift/RHCOS nodes with multipathd, blacklist sanim devices in `/etc/multipath.conf`:
 
-Add to /etc/multipath.conf on all worker nodes:
 ```
-blacklist {
-    wwid ".*"
-    devnode "^sd[a-z]+"
-}
-blacklist_exceptions {
-    property "(SCSI_IDENT_|ID_WWN)"
-}
 blacklist {
     device {
         vendor "LIO-ORG"
@@ -341,17 +216,9 @@ blacklist {
 }
 ```
 
-Or specifically blacklist by IQN pattern:
-```
-blacklist {
-    wwid "iqn.2020-05.com.thoughtexpo:storage.*"
-}
-```
+Or by IQN: `wwid "iqn.2020-05.com.thoughtexpo:storage.*"`
 
-After updating, reload multipathd:
-```bash
-systemctl reload multipathd
-```
+Reload: `systemctl reload multipathd`
 
 ## Cleanup
 
@@ -368,34 +235,24 @@ oc delete pvc -n sanim-system --all
 ## Requirements
 
 - OpenShift 4.x or Kubernetes 1.20+
-- StorageClass with `WaitForFirstConsumer` binding mode
-- **StorageClass MUST support `volumeMode: Block`** (raw block volumes)
+- **StorageClass with `volumeMode: Block` and `WaitForFirstConsumer` binding**
 - Nodes with `topology.kubernetes.io/zone` labels
-- Cluster admin privileges (for SCC creation)
+- Cluster admin (for SCC creation)
 
-**Important**: Verify your StorageClass supports block volumes:
-```bash
-oc get storageclass <your-class> -o yaml | grep volumeBindingMode
-# Should show: volumeBindingMode: WaitForFirstConsumer
-```
-
-If your StorageClass doesn't support block mode, sanim PVCs will fail to bind.
+Verify: `oc get sc <your-class> -o yaml | grep -E 'volumeBindingMode|volumeMode'`
 
 ## File Structure
 
 ```
-oss/iscsi/
-├── Containerfile          # Fedora 43 with targetcli and debug tools
-├── config.env            # Configuration (IQN/device prefixes now hardcoded)
-├── generate.sh           # Main generator (reads from scripts/)
-├── resources.yaml        # Generated (543 lines, 9 K8s resources)
+sanim/
+├── Containerfile          # Fedora 43 + targetcli + debug tools
+├── config.env            # User configuration
+├── generate.sh           # Main generator (-m flag for zone mapping)
+├── resources.yaml        # Generated K8s resources
 ├── validate.sh           # Post-deployment validation
-├── README.md             # This file
-├── summary.txt           # Design document with live testing insights
-└── scripts/              # Externalized for IDE syntax highlighting
-    ├── sts-global.sh     # Global target entrypoint
-    ├── sts-zonal.sh      # Zonal target entrypoint
-    └── ds-init.sh        # Initiator entrypoint
+├── README.md / summary.txt
+└── scripts/              # Entrypoint scripts (IDE syntax highlighting)
+    ├── sts-global.sh, sts-zonal.sh, ds-init.sh
 ```
 
 ## License

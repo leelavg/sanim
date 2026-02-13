@@ -2,183 +2,134 @@ SANIM - SAN SIMULATOR (PRODUCTION-READY)
 ==========================================
 
 Project Overview:
-A zero-dependency Bash generator providing iSCSI block storage on AWS/OpenShift 
-clusters using Fedora 43 containers. Battle-tested and hardened through live 
-cluster deployment with comprehensive fixes applied.
+Zero-dependency Bash generator for iSCSI block storage on Kubernetes/OpenShift using
+Fedora 43 containers. Battle-tested through live cluster deployment with comprehensive
+fixes from two major testing sessions.
 
 Architecture:
-- STS-Global: Single-replica StatefulSet exporting LUNs cluster-wide from one zone
-- STS-Zonal: Multi-replica StatefulSet (1 per zone) with shared-nothing architecture
-- DS-Initiator: DaemonSet maintaining iSCSI sessions via host kernel (survives restarts)
-- ConfigMap: Contains all entrypoint scripts (sts-global.sh, sts-zonal.sh, ds-init.sh)
-- SCC: Custom SecurityContextConstraints for privileged operations
-- ServiceAccount: Explicit SA with SCC binding
+- STS-Global: Single-replica StatefulSet (port 3260) exporting cluster-wide LUNs
+- STS-Zonal: Per-zone StatefulSet (port 3261) with shared-nothing architecture
+- DS-Initiator: DaemonSet with sysfs-based session monitoring (10s interval, 15s timeout)
+- Headless Services: Stable pod DNS (global-0.global-service, zonal-{zone}-0.zonal-{zone}-service)
+- ConfigMap: Entrypoint scripts (sts-global.sh, sts-zonal.sh, ds-init.sh) + node-zone-map
+- SCC: Custom SecurityContextConstraints with separate SAs for targets and initiators
 
-Key Design Decisions:
-1. StatefulSets provide stable DNS and sticky PVCs with zone affinity
-2. "Dumb" initiator pattern: sessions managed by host kernel, not container
-3. No iscsid in containers to avoid conflicts and ensure session persistence
-4. Downward API for zone detection (no kubectl dependency)
-5. HostToContainer mount propagation (initiator uses nsenter to host)
-6. volumeMode: Block for raw device access
-7. Externalized scripts for IDE syntax highlighting
+Key Architecture Decisions:
+1. Pod networking for targets (no hostNetwork) - stable DNS, avoids port conflicts
+2. Per-zone StatefulSets - one STS+Service per zone, not 1 STS with N replicas
+3. Port separation - global uses 3260, zonal uses 3261 (kernel binds at host level)
+4. Zone map optimization - 'generate.sh -m' creates zones.txt + node-zone-map.yaml offline
+5. Session persistence - host kernel manages sessions, survives pod restarts
+6. No clearconfig/restoreconfig - prevented kernel listener thread from restarting
+7. Generic functions - check_session_health() and discover_and_login() in ds-init.sh
+8. Sysfs monitoring - structured session health checks via /sys/class/iscsi_session/*/state
+9. Aggressive timeouts - noop_out_timeout=5s, replacement_timeout=15s for fast failure detection
 
-Production Fixes Applied (Live Testing):
-1. ✅ volumeDevices vs /dev mount conflict resolved (removed /dev mount from targets)
-2. ✅ DNS resolution fixed (dnsPolicy: ClusterFirstWithHostNet for hostNetwork pods)
-3. ✅ iscsiadm compatibility (nsenter to host's iscsiadm, removed from container)
-4. ✅ Target mounts added (/var/run/dbus for targetcli, /sys/kernel/config for configfs)
-5. ✅ Initiator termination log path fixed (/tmp/termination-log to avoid /dev conflict)
-6. ✅ IQN hardcoded to domain registration date (iqn.2020-05.com.thoughtexpo:storage)
-7. ✅ Simplified zonal IQN format (removed redundant "zone-" prefix)
-8. ✅ Semantic device prefixes (global-* and zonal-* instead of configurable sanim-*)
-9. ✅ Removed redundant pod securityContext (ignored with privileged: true)
-10. ✅ Added orphaned cleanup to zonal script (matches global robustness)
-11. ✅ Login failure warnings (clear visibility when connections fail)
-12. ✅ Extracted TCP check function (DRY principle)
-13. ✅ Mount propagation optimized (HostToContainer for initiator)
-14. ✅ Removed unnecessary initiator mounts (/var/run/dbus, /sys)
-15. ✅ Containerfile optimized (removed iscsi-initiator-utils, added debug tools)
-16. ✅ Scripts externalized (full IDE syntax highlighting in scripts/ directory)
+Critical Fixes (Live Testing):
+- Portal listener bug: Removed clearconfig/restoreconfig cycle that stopped kernel listener
+- Port binding conflict: Global uses 3260, zonal uses 3261 (binding is per-host-kernel, not per-IQN)
+- Session auto-recovery: Monitor loop checks sysfs every 10s, reconnects on failure
+- Zonal login simplified: Connects only to own zone (no multi-zone sweep)
+- Startup cleanup: Only login if no healthy session exists (prevents stale session accumulation)
+- DNS resolution: dnsPolicy: ClusterFirstWithHostNet for hostNetwork pods
+- iscsiadm compatibility: nsenter to host's iscsiadm (Fedora 43 incompatible with RHCOS kernel)
 
 Configuration (config.env):
 - INSTALL_GLOBAL/INSTALL_ZONAL: Enable/disable deployment types
 - GLOBAL_DISK_COUNT/SIZE: Global LUN configuration (default: 2x10Gi)
 - ZONAL_DISK_COUNT/SIZE: Per-zone LUN configuration (default: 1x10Gi)
-- UNIQUE_ZONE_COUNT: Number of availability zones (default: 3)
-- GLOBAL_ZONE: Required when INSTALL_GLOBAL=true (validated at script start)
-- IMAGE: ghcr.io/leelavg/sanim:latest
-- FORCE_CLEANUP: Control session logout on pod termination (default: false)
 - STORAGE_CLASS: Must support volumeMode: Block (default: gp3-csi)
-- NODE_LABEL_FILTER: Node selector for initiators (default: sanim-node=true)
+- NODE_LABEL_FILTER: Node selector for initiators (default: node-role.kubernetes.io/worker=)
+- IMAGE: Container image path
+- FORCE_CLEANUP: Session logout on pod termination (default: false)
 
-Note: IQN_PREFIX and DEVICE_PREFIX are now hardcoded (not configurable):
-- IQN: iqn.2020-05.com.thoughtexpo:storage (reflects domain registration date)
-- Device prefixes: "global" for shared-storage, "zonal" for shared-nothing
+Hardcoded (not configurable):
+- IQN: iqn.2020-05.com.thoughtexpo:storage (domain registration date)
+- Device prefixes: global-* and zonal-*
+- Ports: 3260 (global), 3261 (zonal)
 
-Files Delivered:
-1. generate.sh (700+ lines, executable) - Main generator with validation
-2. config.env (simplified) - Configuration without hardcoded values
-3. Containerfile (optimized) - Fedora 43 with targetcli and debug tools
-4. validate.sh (280+ lines, executable) - Post-deployment validation
-5. README.md (updated) - Complete documentation with live testing insights
-6. summary.txt - This file
-7. resources.yaml (543 lines, generated) - 9 K8s resources
-8. scripts/ directory:
-   - sts-global.sh - Global target entrypoint (full IDE highlighting)
-   - sts-zonal.sh - Zonal target entrypoint (full IDE highlighting)
-   - ds-init.sh - Initiator entrypoint (full IDE highlighting)
-
-Resource Headers:
-All resources use "#," prefix for easy inspection via: grep '^#,' resources.yaml
-
-Generated Resources (9 total):
-1. Namespace (sanim-system)
-2. ConfigMap (scripts with entrypoints)
-3. ServiceAccount (default, explicit creation)
-4. SecurityContextConstraints (sanim-privileged)
-5. StatefulSet + Service (global target, conditional)
-6. StatefulSet + Service (zonal targets, conditional)
-7. DaemonSet (initiators)
+Zone Management:
+- Run 'generate.sh -m' first - queries cluster nodes, writes zones.txt + node-zone-map.yaml
+- Then 'generate.sh' - reads zones.txt offline, auto-selects first zone for global target
+- No GLOBAL_ZONE or UNIQUE_ZONE_COUNT needed in config.env
 
 Deployment Flow:
-1. User surveys cluster: oc get nodes --show-labels
-2. User edits config.env with zone and node filter settings
-3. Run: bash generate.sh (validates config, generates YAML)
-4. Deploy: oc apply -f resources.yaml
-5. Validate: bash validate.sh (checks kernel sessions)
+1. Survey cluster: oc get nodes --show-labels
+2. Generate zone map: bash generate.sh -m (creates zones.txt + node-zone-map.yaml)
+3. Apply zone map: oc apply -f node-zone-map.yaml --server-side --force-conflicts
+4. Edit config.env with disk sizes and node filter
+5. Generate resources: bash generate.sh (reads zones.txt offline)
+6. Deploy: oc apply -f resources.yaml --server-side --force-conflicts
+7. Validate: bash validate.sh (checks kernel sessions)
 
-Technical Highlights:
-✓ Zero kubectl dependency (downward API for zones)
-✓ "Dumb" initiator (sessions survive pod restarts)
-✓ Conditional Global/Zonal deployment
-✓ Resource headers with "#," for easy grepping
-✓ Proper security (custom SCC with explicit SA)
-✓ Complete validation script with kernel verification
-✓ Kernel module loading and configfs management
-✓ Orphaned target cleanup in /sys/kernel/config
-✓ TCP port pre-checks before iSCSI discovery
-✓ Multi-signal trap (SIGTERM + SIGINT)
-✓ LUN count validation and warnings
-✓ Graceful error handling throughout
-✓ nsenter pattern for host iscsiadm compatibility
-✓ Externalized scripts for IDE syntax highlighting
+Key Files:
+- generate.sh: Main generator with -m flag for zone mapping
+- scripts/sts-global.sh: Global target entrypoint (port 3260)
+- scripts/sts-zonal.sh: Zonal target entrypoint (port 3261)
+- scripts/ds-init.sh: Initiator with generic health check and login functions
+- config.env: User configuration
+- Containerfile: Fedora 43 with targetcli and debug tools
+- resources.yaml: Generated K8s resources (Namespace, ConfigMaps, SCCs, SAs, STSs, Services, DS)
 
-Final IQN Formats:
-- Global: iqn.2020-05.com.thoughtexpo:storage:global
-- Zonal (example): iqn.2020-05.com.thoughtexpo:storage:us-west-1a
-- Initiator: iqn.1994-05.com.redhat:<node-id> (from RHCOS host)
+IQN and Device Naming:
+- Global IQN: iqn.2020-05.com.thoughtexpo:storage:global
+- Zonal IQN: iqn.2020-05.com.thoughtexpo:storage:{zone} (e.g., us-west-2b)
+- Initiator IQN: iqn.1994-05.com.redhat:{node-id} (from RHCOS host)
+- Global devices: /dev/global-0, /dev/global-1
+- Zonal devices: /dev/zonal-0, /dev/zonal-1
 
-Device Mappings:
-- Global: /dev/global-0, /dev/global-1 (self-documenting)
-- Zonal: /dev/zonal-0, /dev/zonal-1 (self-documenting)
+Target Flow (sts-global.sh, sts-zonal.sh):
+- Load kernel modules: target_core_mod, iscsi_target_mod
+- Mount /sys/kernel/config (configfs), /var/run/dbus (targetcli communication)
+- Clean orphaned objects in configfs (if present)
+- Configure iSCSI targets via targetcli
+- Export PVC block devices as LUNs (via volumeDevices)
+- Global binds ::0:3260, zonal binds 0.0.0.0:3261
+- Run 'targetcli saveconfig' (no clearconfig/restoreconfig)
+- No CHAP authentication
 
-iSCSI Flow:
-Target (STS):
-- Loads kernel modules (target_core_mod, iscsi_target_mod)
-- Mounts configfs to /sys/kernel/config
-- Mounts /var/run/dbus (ro) for targetcli communication
-- Cleans up orphaned objects if clearconfig fails
-- Runs targetcli to configure iSCSI targets
-- Exports block devices from PVCs as LUNs (via volumeDevices)
-- One IQN per target type (global or zone-specific)
-- No CHAP authentication (simplified for dev/test)
-- Uses sleep infinity & wait for proper signal handling
-
-Initiator (DS):
-- Uses nsenter to run host's iscsiadm (compatibility fix)
-- Verifies host initiator name usage
-- Waits for portal readiness (TCP port 3260 check via reusable function)
-- Discovers targets via DNS (headless services)
-- Performs iscsiadm login with retry logic and failure warnings
-- Sessions persist in host kernel (not container)
-- Zone-aware discovery for zonal targets
-- Sweeps all IPs to find matching zone target
-- Handles SIGTERM and SIGINT for cleanup
+Initiator Flow (ds-init.sh):
+- Use nsenter to run host's iscsiadm (Fedora 43 compatibility)
+- Check for existing healthy sessions via sysfs (skip login if found)
+- Discover targets via headless Service DNS
+- Login with aggressive timeouts (noop_out_timeout=5s, replacement_timeout=15s)
+- Monitor loop: check sysfs every 10s, reconnect on failure
+- Zonal: Only connect to own zone target (uses node-zone-map)
+- Sessions persist in host kernel across pod restarts
 - Mounts: /dev, /etc/iscsi, /var/lib/iscsi (HostToContainer propagation)
 
 Security:
-- Custom SCC allows: hostPath, hostNetwork, hostPID, privileged containers
-- SCC bound to explicit ServiceAccount in namespace
+- Custom SCCs: sanim-target (hostNetwork, hostPorts) and sanim-initiator (hostPID)
+- Separate ServiceAccounts bound to respective SCCs
 - automountServiceAccountToken: false (no K8s API access needed)
 - Requires cluster admin for SCC creation
 
 Multipath Configuration:
-On OpenShift/RHCOS nodes with multipathd, blacklist sanim devices:
-- Add LIO-ORG vendor blacklist to /etc/multipath.conf
-- Or blacklist by IQN pattern: iqn.2020-05.com.thoughtexpo:storage.*
-- Reload: systemctl reload multipathd
+Add to /etc/multipath.conf on worker nodes:
+```
+blacklist {
+    device {
+        vendor "LIO-ORG"
+        product ".*"
+    }
+}
+```
+Or blacklist by IQN: `wwid "iqn.2020-05.com.thoughtexpo:storage.*"`
+Reload: `systemctl reload multipathd`
 
 Troubleshooting:
-- Kernel logs: dmesg | grep -i iscsi
-- From pod: cat /dev/kmsg | grep -i iscsi
-- From node: oc debug node/<name> → chroot /host → dmesg
-- Common errors: connection errors, session recovery timeouts, login failures
-- Validation: bash validate.sh (checks kernel sessions and block devices)
+- Kernel logs: `dmesg | grep -i iscsi` or `oc debug node/<name> → chroot /host → journalctl -k | grep -i iscsi`
+- Session health: Check /sys/class/iscsi_session/session*/state (should show LOGGED_IN)
+- Validation: `bash validate.sh` (checks kernel sessions and block devices)
+- Common errors: Connection timeouts (check Service DNS), login failures (check kernel logs), port conflicts (verify global=3260, zonal=3261)
 
-Testing Recommendations:
-1. Start with INSTALL_GLOBAL=true, INSTALL_ZONAL=false
-2. Verify one target works before enabling zonal
-3. Monitor kernel logs during deployment
-4. Run validate.sh after deployment
-5. Test pod restart scenarios (sessions should persist)
-6. Verify block devices visible: lsblk
-
-Known Limitations (by design):
-- No CHAP authentication (intentional for dev/test)
+Known Limitations:
+- No CHAP authentication (dev/test only)
 - Requires privileged containers and host access
 - StorageClass must support volumeMode: Block
-- Multipath must be manually configured on hosts
 - Not recommended for production workloads
-
-Real-World Considerations:
-- AWS EBS attachment delays may affect startup
-- Node-specific kernel versions may vary behavior
-- StorageClass provisioning quirks are environment-specific
-- All edge cases handled gracefully with retries and fallbacks
-- Fedora 43 iscsiadm incompatible with RHCOS kernel (solved via nsenter)
+- Multipath must be manually configured
 
 Repository: leelavg/sanim
-Domain: thoughtexpo.com (registered May 2020)
-Image Registry: ghcr.io
-Status: Production-ready with comprehensive hardening and live testing validation
+Domain: thoughtexpo.com (May 2020)
+Status: Production-ready, battle-tested on live OpenShift clusters

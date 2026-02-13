@@ -53,7 +53,10 @@ fi
 IQN="${IQN_PREFIX}:${ZONE}"
 targetcli /iscsi create "$IQN"
 
-# Keep default ::0:3260 portal (pod networking, no conflict)
+# Delete default portal and create on port 3261 to avoid conflict with global (port 3260)
+targetcli /iscsi/$IQN/tpg1/portals delete ::0 3260 2>/dev/null || true
+targetcli /iscsi/$IQN/tpg1/portals create ::0 3261
+
 # Enable the TPG (this starts the listener)
 targetcli /iscsi/$IQN/tpg1 enable
 
@@ -74,8 +77,8 @@ targetcli /iscsi ls
 # Save configuration for persistence
 targetcli saveconfig
 
-echo "Target ready and listening on port 3260"
-ss -tlnp | grep 3260 || echo "Warning: Port 3260 not listening"
+echo "Target ready and listening on port 3261"
+ss -tlnp | grep 3261 || echo "Warning: Port 3261 not listening"
 
 # Keep running (sleep infinity allows proper signal handling)
 sleep infinity & wait

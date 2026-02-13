@@ -13,7 +13,59 @@ resolve_host() {
   getent hosts "$hostname" | awk '{print $1}' | head -1
 }
 
-# Removed check_portal - iscsiadm discovery will handle retries
+# Generic function to check if session is healthy via sysfs
+check_session_health() {
+  local iqn="$1"
+  for session in $(nsenter -t 1 -m bash -c "ls -d /sys/class/iscsi_session/session* 2>/dev/null || true"); do
+    targetname=$(nsenter -t 1 -m cat "$session/targetname" 2>/dev/null || echo "")
+    state=$(nsenter -t 1 -m cat "$session/state" 2>/dev/null || echo "")
+    if [ "$targetname" = "$iqn" ] && [ "$state" = "LOGGED_IN" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Generic function to discover and login to target
+discover_and_login() {
+  local iqn="$1"
+  local pod_dns="$2"
+  local port="${3:-3260}"  # Default to 3260 if not specified
+
+  echo "Resolving $pod_dns..."
+  local ip=$(resolve_host "$pod_dns")
+  if [ -z "$ip" ]; then
+    echo "Error: Failed to resolve $pod_dns"
+    return 1
+  fi
+  echo "Resolved to $ip"
+
+  echo "Discovering target at $ip:$port..."
+  for attempt in {1..5}; do
+    if $ISCSIADM --mode discovery --type sendtargets --portal "$ip:$port" 2>/dev/null; then
+      echo "Discovery successful on attempt $attempt"
+      break
+    fi
+    echo "Discovery attempt $attempt failed, retrying..."
+    sleep 2
+  done
+
+  echo "Logging into target $iqn..."
+  for attempt in {1..5}; do
+    if $ISCSIADM --mode node --targetname "$iqn" --portal "$ip:$port" --login 2>/dev/null; then
+      echo "Login successful on attempt $attempt"
+      # Configure aggressive timeouts for fast failure detection
+      $ISCSIADM --mode node --targetname "$iqn" --portal "$ip:$port" --op update -n node.conn[0].timeo.noop_out_timeout -v 5 2>/dev/null || true
+      $ISCSIADM --mode node --targetname "$iqn" --portal "$ip:$port" --op update -n node.session.timeo.replacement_timeout -v 15 2>/dev/null || true
+      return 0
+    fi
+    echo "Login attempt $attempt failed, retrying..."
+    sleep 2
+  done
+
+  echo "Warning: Failed to login to $iqn after all retries"
+  return 1
+}
 
 # Trap for cleanup
 cleanup() {
@@ -40,109 +92,35 @@ if [ -z "$LOCAL_ZONE" ]; then
 fi
 echo "Detected zone: $LOCAL_ZONE (node IP: $NODE_IP)"
 
-# Function to discover and login to global target
-discover_and_login_global() {
-  GLOBAL_IQN="${IQN_PREFIX}:global"
-  GLOBAL_POD_DNS="global-0.global-service.${NAMESPACE}.svc.cluster.local"
-
-  echo "Resolving $GLOBAL_POD_DNS..."
-  GLOBAL_IP=$(resolve_host "$GLOBAL_POD_DNS")
-  if [ -z "$GLOBAL_IP" ]; then
-    echo "Error: Failed to resolve $GLOBAL_POD_DNS"
-    return 1
-  fi
-  echo "Resolved to $GLOBAL_IP"
-
-  echo "Discovering global target at $GLOBAL_IP..."
-  for attempt in {1..5}; do
-    if $ISCSIADM --mode discovery --type sendtargets --portal "$GLOBAL_IP" 2>/dev/null; then
-      echo "Discovery successful on attempt $attempt"
-      break
-    fi
-    echo "Discovery attempt $attempt failed, retrying..."
-    sleep 2
-  done
-
-  echo "Logging into global target $GLOBAL_IQN..."
-  for attempt in {1..5}; do
-    if $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --portal "$GLOBAL_IP" --login 2>/dev/null; then
-      echo "Login successful on attempt $attempt"
-      # Configure aggressive timeouts for fast failure detection
-      $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --portal "$GLOBAL_IP" --op update -n node.conn[0].timeo.noop_out_timeout -v 5 2>/dev/null || true
-      $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --portal "$GLOBAL_IP" --op update -n node.session.timeo.replacement_timeout -v 15 2>/dev/null || true
-      return 0
-    fi
-    echo "Login attempt $attempt failed, retrying..."
-    sleep 2
-  done
-
-  echo "Warning: Failed to login to global target after all retries"
-  return 1
-}
-
 # Login to global target if enabled
 if [ "${INSTALL_GLOBAL}" == "true" ]; then
   GLOBAL_IQN="${IQN_PREFIX}:global"
-  # Check if we already have a healthy session via sysfs (pod restart scenario)
-  HEALTHY_SESSION=false
-  for session in $(nsenter -t 1 -m bash -c "ls -d /sys/class/iscsi_session/session* 2>/dev/null || true"); do
-    targetname=$(nsenter -t 1 -m cat "$session/targetname" 2>/dev/null || echo "")
-    state=$(nsenter -t 1 -m cat "$session/state" 2>/dev/null || echo "")
-    if [ "$targetname" = "$GLOBAL_IQN" ] && [ "$state" = "LOGGED_IN" ]; then
-      HEALTHY_SESSION=true
-      break
-    fi
-  done
+  GLOBAL_POD_DNS="global-0.global-service.${NAMESPACE}.svc.cluster.local"
 
-  if [ "$HEALTHY_SESSION" = "true" ]; then
+  if check_session_health "$GLOBAL_IQN"; then
     echo "Healthy session already exists for $GLOBAL_IQN, skipping login"
   else
-    # Cleanup any stale/broken sessions
     echo "No healthy session found, cleaning up stale sessions for $GLOBAL_IQN..."
     $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --logout 2>/dev/null || true
     $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --op delete 2>/dev/null || true
-    discover_and_login_global
+    discover_and_login "$GLOBAL_IQN" "$GLOBAL_POD_DNS"
   fi
 fi
 
-# Login to zonal target if enabled (port 3261)
+# Login to zonal target if enabled
 if [ "${INSTALL_ZONAL}" == "true" ]; then
   LOCAL_ZONE_IQN="${IQN_PREFIX}:${LOCAL_ZONE}"
-  ZONAL_SVC="zonal-service.${NAMESPACE}.svc.cluster.local"
-  ZONAL_PORT="3261"
+  # Zone name may have dots, replace with dashes for DNS-safe service name
+  LOCAL_ZONE_SAFE=$(echo "$LOCAL_ZONE" | tr '.' '-')
+  ZONAL_POD_DNS="zonal-${LOCAL_ZONE_SAFE}-0.zonal-${LOCAL_ZONE_SAFE}-service.${NAMESPACE}.svc.cluster.local"
 
-  echo "Discovering zonal targets at $ZONAL_SVC:$ZONAL_PORT..."
-  IPS=$(getent hosts "$ZONAL_SVC" | awk '{print $1}')
-  ZONAL_LOGIN_SUCCESS=false
-
-  for IP in $IPS; do
-    echo "Checking portal $IP:$ZONAL_PORT for zone $LOCAL_ZONE..."
-
-    # Pre-check: ensure portal is listening before discovery
-    if ! timeout 1 bash -c "cat < /dev/tcp/${IP}/${ZONAL_PORT}" 2>/dev/null; then
-      echo "Portal $IP:$ZONAL_PORT not listening, skipping..."
-      continue
-    fi
-
-    # Use || true to continue if this portal is unready
-    if $ISCSIADM --mode discovery --type sendtargets --portal "$IP:$ZONAL_PORT" 2>/dev/null | grep -q "$LOCAL_ZONE_IQN"; then
-      echo "Found matching zone target at $IP:$ZONAL_PORT, logging in..."
-      for attempt in {1..5}; do
-        if $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --portal "$IP:$ZONAL_PORT" --login 2>/dev/null; then
-          echo "Login successful on attempt $attempt"
-          ZONAL_LOGIN_SUCCESS=true
-          break 2
-        fi
-        echo "Login attempt $attempt failed, retrying..."
-        sleep 2
-      done
-    else
-      echo "Portal $IP:$ZONAL_PORT ready but no matching zone, trying next..."
-    fi
-  done
-
-  if [ "$ZONAL_LOGIN_SUCCESS" = false ]; then
-    echo "Warning: Failed to login to zonal target for zone $LOCAL_ZONE after checking all portals"
+  if check_session_health "$LOCAL_ZONE_IQN"; then
+    echo "Healthy session already exists for $LOCAL_ZONE_IQN, skipping login"
+  else
+    echo "No healthy session found, cleaning up stale sessions for $LOCAL_ZONE_IQN..."
+    $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --logout 2>/dev/null || true
+    $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --op delete 2>/dev/null || true
+    discover_and_login "$LOCAL_ZONE_IQN" "$ZONAL_POD_DNS" 3261
   fi
 fi
 
@@ -157,23 +135,28 @@ echo "Starting session monitor loop (checking every 10s)..."
 while true; do
   if [ "${INSTALL_GLOBAL}" == "true" ]; then
     GLOBAL_IQN="${IQN_PREFIX}:global"
-    # Check sysfs for healthy session
-    HEALTHY_SESSION=false
-    for session in $(nsenter -t 1 -m bash -c "ls -d /sys/class/iscsi_session/session* 2>/dev/null || true"); do
-      targetname=$(nsenter -t 1 -m cat "$session/targetname" 2>/dev/null || echo "")
-      state=$(nsenter -t 1 -m cat "$session/state" 2>/dev/null || echo "")
-      if [ "$targetname" = "$GLOBAL_IQN" ] && [ "$state" = "LOGGED_IN" ]; then
-        HEALTHY_SESSION=true
-        break
-      fi
-    done
+    GLOBAL_POD_DNS="global-0.global-service.${NAMESPACE}.svc.cluster.local"
 
-    if [ "$HEALTHY_SESSION" = "false" ]; then
+    if ! check_session_health "$GLOBAL_IQN"; then
       echo "$(date): Global session unhealthy or missing, cleaning up..."
       $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --logout 2>/dev/null || true
       $ISCSIADM --mode node --targetname "$GLOBAL_IQN" --op delete 2>/dev/null || true
       echo "$(date): Rediscovering and logging in..."
-      discover_and_login_global || echo "Failed to re-establish global session"
+      discover_and_login "$GLOBAL_IQN" "$GLOBAL_POD_DNS" || echo "Failed to re-establish global session"
+    fi
+  fi
+
+  if [ "${INSTALL_ZONAL}" == "true" ]; then
+    LOCAL_ZONE_IQN="${IQN_PREFIX}:${LOCAL_ZONE}"
+    LOCAL_ZONE_SAFE=$(echo "$LOCAL_ZONE" | tr '.' '-')
+    ZONAL_POD_DNS="zonal-${LOCAL_ZONE_SAFE}-0.zonal-${LOCAL_ZONE_SAFE}-service.${NAMESPACE}.svc.cluster.local"
+
+    if ! check_session_health "$LOCAL_ZONE_IQN"; then
+      echo "$(date): Zonal session unhealthy or missing, cleaning up..."
+      $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --logout 2>/dev/null || true
+      $ISCSIADM --mode node --targetname "$LOCAL_ZONE_IQN" --op delete 2>/dev/null || true
+      echo "$(date): Rediscovering and logging in..."
+      discover_and_login "$LOCAL_ZONE_IQN" "$ZONAL_POD_DNS" 3261 || echo "Failed to re-establish zonal session"
     fi
   fi
 
