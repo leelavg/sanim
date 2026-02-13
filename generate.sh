@@ -62,13 +62,22 @@ DS_INIT_SCRIPT=$(cat "$SCRIPT_DIR/ds-init.sh")
 generate_zone_map_configmap() {
   local mapping=""
   mapping=$(oc get nodes -o jsonpath='{range .items[*]}{"    "}{.status.addresses[?(@.type=="InternalIP")].address}{"="}{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}{end}' -l "$NODE_LABEL_FILTER")
-  
+
   if [ -z "$mapping" ]; then
     echo "Error: No nodes with zone labels found" >&2
     exit 1
   fi
-  
+
   cat <<EOF
+#, Namespace for sanim resources
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: sanim
+
 #, ConfigMap for node-to-zone mapping
 ---
 apiVersion: v1
@@ -130,22 +139,24 @@ metadata:
   name: sanim
   namespace: ${NAMESPACE}
 
-#, Custom SecurityContextConstraints for privileged operations
+#, SecurityContextConstraints for iSCSI targets
 ---
 apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
 metadata:
-  name: sanim-privileged
+  name: sanim-target
   labels:
     app.kubernetes.io/name: sanim
 allowHostDirVolumePlugin: true
 allowHostIPC: false
 allowHostNetwork: true
-allowHostPID: true
-allowHostPorts: false
+allowHostPID: false
+allowHostPorts: true
 allowPrivilegedContainer: true
 allowedCapabilities:
-- '*'
+- SYS_ADMIN
+- SYS_MODULE
+- NET_ADMIN
 defaultAddCapabilities: null
 fsGroup:
   type: RunAsAny
@@ -159,9 +170,63 @@ seLinuxContext:
 supplementalGroups:
   type: RunAsAny
 users:
-- system:serviceaccount:${NAMESPACE}:sanim
+- system:serviceaccount:${NAMESPACE}:sanim-target
 volumes:
-- '*'
+- configMap
+- emptyDir
+- hostPath
+- persistentVolumeClaim
+
+#, SecurityContextConstraints for iSCSI initiators
+---
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: sanim-initiator
+  labels:
+    app.kubernetes.io/name: sanim
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: true
+allowHostPID: true
+allowHostPorts: false
+allowPrivilegedContainer: true
+allowedCapabilities:
+- SYS_ADMIN
+- SYS_MODULE
+defaultAddCapabilities: null
+fsGroup:
+  type: RunAsAny
+priority: null
+readOnlyRootFilesystem: false
+requiredDropCapabilities: null
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+users:
+- system:serviceaccount:${NAMESPACE}:sanim-initiator
+volumes:
+- configMap
+- hostPath
+
+#, ServiceAccount for iSCSI targets
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sanim-target
+  namespace: ${NAMESPACE}
+
+#, ServiceAccount for iSCSI initiators
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sanim-initiator
+  namespace: ${NAMESPACE}
 
 YAML
 
@@ -194,8 +259,11 @@ spec:
         app.kubernetes.io/component: target
         sanim.io/type: global
     spec:
-      serviceAccountName: sanim
+      serviceAccountName: sanim-target
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 2
+      # Using pod networking for proper Service routing
+      # Note: iSCSI sessions will break on pod restart - initiators must reconnect
       nodeSelector:
         topology.kubernetes.io/zone: ${GLOBAL_ZONE}
       containers:
@@ -278,7 +346,7 @@ YAML
 
   cat >> resources.yaml <<YAML
 
-#, Headless Service for global target DNS
+#, Headless Service for global target (provides stable pod DNS)
 ---
 apiVersion: v1
 kind: Service
@@ -299,6 +367,7 @@ spec:
   - name: iscsi
     port: 3260
     targetPort: 3260
+    protocol: TCP
 
 YAML
 fi
@@ -332,8 +401,10 @@ spec:
         app.kubernetes.io/component: target
         sanim.io/type: zonal
     spec:
-      serviceAccountName: sanim
+      serviceAccountName: sanim-target
       automountServiceAccountToken: false
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
@@ -352,6 +423,8 @@ spec:
           value: "${IQN_PREFIX}"
         - name: ZONAL_DISK_COUNT
           value: "${ZONAL_DISK_COUNT}"
+        - name: GLOBAL_DISK_COUNT
+          value: "${GLOBAL_DISK_COUNT}"
         - name: NODE_IP
           valueFrom:
             fieldRef:
@@ -481,8 +554,9 @@ spec:
         app.kubernetes.io/name: sanim
         app.kubernetes.io/component: initiator
     spec:
-      serviceAccountName: sanim
+      serviceAccountName: sanim-initiator
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 2
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet

@@ -3,39 +3,16 @@ set -euo pipefail
 
 echo "Starting sanim zonal target..."
 
-# Load kernel modules and mount configfs
+# Mount configfs FIRST, then load modules
+mount -t configfs none /sys/kernel/config 2>/dev/null || true
+
+# Load kernel modules in correct order
 modprobe target_core_mod || true
+modprobe target_core_iblock || true
 modprobe iscsi_target_mod || true
-mount -t configfs none /sys/kernel/config || true
 
-# Clear existing config (handle locked states gracefully)
-targetcli clearconfig confirm=true || {
-  echo "Warning: clearconfig failed, attempting forced cleanup..."
-
-  # Try to remove orphaned objects from configfs
-  if [ -d /sys/kernel/config/target/iscsi ]; then
-    shopt -s nullglob
-    for iqn in /sys/kernel/config/target/iscsi/iqn.*; do
-      [ -d "$iqn" ] && echo "Removing orphaned IQN: $(basename $iqn)"
-      rmdir "$iqn/tpgt_1/acls/"* 2>/dev/null || true
-      rmdir "$iqn/tpgt_1/lun/"* 2>/dev/null || true
-      rmdir "$iqn/tpgt_1" 2>/dev/null || true
-      rmdir "$iqn" 2>/dev/null || true
-    done
-    shopt -u nullglob
-  fi
-
-  if [ -d /sys/kernel/config/target/core ]; then
-    shopt -s nullglob
-    for backstore in /sys/kernel/config/target/core/iblock_*/*; do
-      [ -d "$backstore" ] && echo "Removing orphaned backstore: $(basename $backstore)"
-      rmdir "$backstore" 2>/dev/null || true
-    done
-    shopt -u nullglob
-  fi
-
-  targetcli ls || true
-}
+# Give kernel time to initialize
+sleep 2
 
 # Get zone from node-zone-map ConfigMap
 NODE_IP="${NODE_IP}"
@@ -45,6 +22,18 @@ if [ -z "$ZONE" ]; then
   exit 1
 fi
 echo "Detected zone: $ZONE (node IP: $NODE_IP)"
+
+# Clean up only our specific IQN and backstores
+IQN="${IQN_PREFIX}:${ZONE}"
+if [ -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
+  echo "Cleaning up existing target: $IQN"
+  targetcli /iscsi delete "$IQN" 2>/dev/null || true
+fi
+
+# Clean up our backstores
+for i in $(seq 0 $((ZONAL_DISK_COUNT - 1))); do
+  targetcli /backstores/block delete "zonal-lun$i" 2>/dev/null || true
+done
 
 # Discover LUNs
 LUNS=($(ls /dev/zonal-* 2>/dev/null | sort -V || true))
@@ -64,14 +53,15 @@ fi
 IQN="${IQN_PREFIX}:${ZONE}"
 targetcli /iscsi create "$IQN"
 
-# Delete default IPv6 portal (keep IPv4 0.0.0.0:3260)
-targetcli /iscsi/$IQN/tpg1/portals delete :: 3260 2>/dev/null || true
+# Keep default ::0:3260 portal (pod networking, no conflict)
+# Enable the TPG (this starts the listener)
+targetcli /iscsi/$IQN/tpg1 enable
 
 # Configure LUNs
 for i in "${!LUNS[@]}"; do
   LUN_PATH="${LUNS[$i]}"
-  targetcli /backstores/block create "lun$i" "$LUN_PATH"
-  targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/lun$i"
+  targetcli /backstores/block create "zonal-lun$i" "$LUN_PATH"
+  targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/zonal-lun$i"
 done
 
 # Disable authentication
@@ -80,6 +70,12 @@ targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protec
 
 echo "Zonal target configured: $IQN with ${#LUNS[@]} LUNs"
 targetcli /iscsi ls
+
+# Save configuration for persistence
+targetcli saveconfig
+
+echo "Target ready and listening on port 3260"
+ss -tlnp | grep 3260 || echo "Warning: Port 3260 not listening"
 
 # Keep running (sleep infinity allows proper signal handling)
 sleep infinity & wait

@@ -17,6 +17,7 @@ RUN dnf install -y \
     bind-utils \
     iputils \
     tcpdump \
+    hostname \
     && dnf clean all
 
 # Note: iscsi-initiator-utils NOT needed - we use nsenter to host's iscsiadm

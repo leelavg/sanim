@@ -3,39 +3,29 @@ set -euo pipefail
 
 echo "Starting sanim global target..."
 
-# Load kernel modules and mount configfs
+# Mount configfs FIRST, then load modules
+mount -t configfs none /sys/kernel/config 2>/dev/null || true
+
+# Load kernel modules in correct order
 modprobe target_core_mod || true
+modprobe target_core_iblock || true
 modprobe iscsi_target_mod || true
-mount -t configfs none /sys/kernel/config || true
 
-# Clear existing config (handle locked states gracefully)
-targetcli clearconfig confirm=true || {
-  echo "Warning: clearconfig failed, attempting forced cleanup..."
+# Give kernel time to initialize
+sleep 2
 
-  # Try to remove orphaned objects from configfs
-  if [ -d /sys/kernel/config/target/iscsi ]; then
-    shopt -s nullglob
-    for iqn in /sys/kernel/config/target/iscsi/iqn.*; do
-      [ -d "$iqn" ] && echo "Removing orphaned IQN: $(basename $iqn)"
-      rmdir "$iqn/tpgt_1/acls/"* 2>/dev/null || true
-      rmdir "$iqn/tpgt_1/lun/"* 2>/dev/null || true
-      rmdir "$iqn/tpgt_1" 2>/dev/null || true
-      rmdir "$iqn" 2>/dev/null || true
-    done
-    shopt -u nullglob
-  fi
+# With hostNetwork, multiple pods share the same kernel target subsystem
+# Clean up only our specific IQN and backstores
+IQN="${IQN_PREFIX}:global"
+if [ -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
+  echo "Cleaning up existing target: $IQN"
+  targetcli /iscsi delete "$IQN" 2>/dev/null || true
+fi
 
-  if [ -d /sys/kernel/config/target/core ]; then
-    shopt -s nullglob
-    for backstore in /sys/kernel/config/target/core/iblock_*/*; do
-      [ -d "$backstore" ] && echo "Removing orphaned backstore: $(basename $backstore)"
-      rmdir "$backstore" 2>/dev/null || true
-    done
-    shopt -u nullglob
-  fi
-
-  targetcli ls || true
-}
+# Clean up our backstores (global uses lun0 to lun{GLOBAL_DISK_COUNT-1})
+for i in $(seq 0 $((GLOBAL_DISK_COUNT - 1))); do
+  targetcli /backstores/block delete "lun$i" 2>/dev/null || true
+done
 
 # Discover LUNs
 LUNS=($(ls /dev/global-* 2>/dev/null | sort -V || true))
@@ -55,8 +45,11 @@ fi
 IQN="${IQN_PREFIX}:global"
 targetcli /iscsi create "$IQN"
 
-# Delete default IPv6 portal (keep IPv4 0.0.0.0:3260)
-targetcli /iscsi/$IQN/tpg1/portals delete :: 3260 2>/dev/null || true
+# Keep the default ::0:3260 portal (it listens on both IPv4 and IPv6)
+# No need to modify portals - the default works fine for pod networking
+
+# Enable the TPG (this actually binds the network portal and starts listening)
+targetcli /iscsi/$IQN/tpg1 enable
 
 # Configure LUNs
 for i in "${!LUNS[@]}"; do
@@ -71,6 +64,12 @@ targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protec
 
 echo "Global target configured: $IQN with ${#LUNS[@]} LUNs"
 targetcli /iscsi ls
+
+# Save configuration for persistence
+targetcli saveconfig
+
+echo "Target ready and listening on port 3260"
+ss -tlnp | grep 3260 || echo "Warning: Port 3260 not listening"
 
 # Keep running (sleep infinity allows proper signal handling)
 sleep infinity & wait
