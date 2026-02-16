@@ -50,29 +50,33 @@ if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
   echo "Discovered LUNs: ${LUNS[@]}"
 fi
 
-# Create iSCSI target only if it doesn't exist
-if [ ! -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
-  echo "Creating new target: $IQN"
-  targetcli /iscsi create "$IQN"
+# Clean up existing target and backstores
+if [ -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
+  echo "Cleaning up existing target: $IQN"
+  targetcli /iscsi delete "$IQN" 2>/dev/null || true
 
-  # Enable the TPG (this actually binds the network portal and starts listening)
-  targetcli /iscsi/$IQN/tpg1 enable
-
-  # Configure LUNs
-  for i in "${!LUNS[@]}"; do
-    LUN_PATH="${LUNS[$i]}"
-    targetcli /backstores/block create "lun$i" "$LUN_PATH"
-    targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/lun$i"
+  # Clean up backstores after IQN is deleted
+  for i in $(seq 0 $((GLOBAL_DISK_COUNT - 1))); do
+    targetcli /backstores/block delete "lun$i" 2>/dev/null || true
   done
-
-  # Disable authentication
-  targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
-  targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
-else
-  echo "Target $IQN already exists, skipping creation"
-  # Ensure TPG is enabled
-  targetcli /iscsi/$IQN/tpg1 enable 2>/dev/null || true
 fi
+
+echo "Creating target: $IQN"
+targetcli /iscsi create "$IQN"
+
+# Enable the TPG (this actually binds the network portal and starts listening)
+targetcli /iscsi/$IQN/tpg1 enable
+
+# Configure LUNs
+for i in "${!LUNS[@]}"; do
+  LUN_PATH="${LUNS[$i]}"
+  targetcli /backstores/block create "lun$i" "$LUN_PATH"
+  targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/lun$i"
+done
+
+# Disable authentication
+targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
+targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
 
 echo "Global target configured: $IQN with ${#LUNS[@]} LUNs"
 targetcli /iscsi ls

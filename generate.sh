@@ -38,6 +38,8 @@ SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")/scripts"
 STS_GLOBAL_SCRIPT=$(cat "$SCRIPT_DIR/sts-global.sh")
 STS_ZONAL_SCRIPT=$(cat "$SCRIPT_DIR/sts-zonal.sh")
 DS_INIT_SCRIPT=$(cat "$SCRIPT_DIR/ds-init.sh")
+READINESS_GLOBAL_SCRIPT=$(cat "$SCRIPT_DIR/readiness-global.sh")
+READINESS_ZONAL_SCRIPT=$(cat "$SCRIPT_DIR/readiness-zonal.sh")
 
 # ============================================================================
 # NETWORK-DEPENDENT FUNCTION (requires oc CLI)
@@ -143,6 +145,10 @@ $(echo "$STS_GLOBAL_SCRIPT" | sed 's/^/    /')
 $(echo "$STS_ZONAL_SCRIPT" | sed 's/^/    /')
   ds-init.sh: |
 $(echo "$DS_INIT_SCRIPT" | sed 's/^/    /')
+  readiness-global.sh: |
+$(echo "$READINESS_GLOBAL_SCRIPT" | sed 's/^/    /')
+  readiness-zonal.sh: |
+$(echo "$READINESS_ZONAL_SCRIPT" | sed 's/^/    /')
 
 #, SecurityContextConstraints for iSCSI targets
 ---
@@ -307,12 +313,7 @@ YAML
         readinessProbe:
           exec:
             command:
-            - /bin/bash
-            - -c
-            - |
-              targetcli /iscsi ls | grep -q 'iqn' && \
-              [ $(targetcli /iscsi ls | grep -c 'o- lun') -gt 0 ] && \
-              ss -tlnp | grep -q ':3260'
+            - /scripts/readiness-global.sh
           initialDelaySeconds: 10
           periodSeconds: 5
       volumes:
@@ -466,12 +467,7 @@ YAML
         readinessProbe:
           exec:
             command:
-            - /bin/bash
-            - -c
-            - |
-              targetcli /iscsi ls | grep -q 'iqn' && \
-              [ $(targetcli /iscsi ls | grep -c 'o- lun') -gt 0 ] && \
-              ss -tlnp | grep -q ':3261'
+            - /scripts/readiness-zonal.sh
           initialDelaySeconds: 10
           periodSeconds: 5
       volumes:
