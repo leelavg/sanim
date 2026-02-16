@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-reader
+  namespace: sanim-system
+spec:
+  serviceAccountName: sanim-initiator
+  hostNetwork: true
+  hostPID: true
+  initContainers:
+  - name: format
+    image: registry.access.redhat.com/ubi9/ubi:latest
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -ex
+
+      IQN="iqn.2020-05.com.thoughtexpo:storage:global"
+
+      # Find device for this IQN
+      DEVICE=$(nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session -P 3 | \
+        awk -v iqn="$IQN" '
+          /Target:/ { current_iqn=$2 }
+          /Attached scsi disk/ && current_iqn==iqn { print "/dev/"$4; exit }
+        ')
+
+      if [ -z "$DEVICE" ]; then
+        echo "No device found for IQN: $IQN"
+        exit 1
+      fi
+
+      echo "Found device: $DEVICE"
+
+      # Write test data directly to block device (first 4KB)
+      DATA="Shared storage test - written at $(date) from $(hostname)"
+      echo "$DATA" | dd of="$DEVICE" bs=4K count=1 conv=fsync
+      echo "Written to $DEVICE"
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: dev
+      mountPath: /dev
+      mountPropagation: HostToContainer
+  containers:
+  - name: reader
+    image: registry.access.redhat.com/ubi9/ubi:latest
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -ex
+
+      IQN="iqn.2020-05.com.thoughtexpo:storage:global"
+
+      DEVICE=$(nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session -P 3 | \
+        awk -v iqn="$IQN" '
+          /Target:/ { current_iqn=$2 }
+          /Attached scsi disk/ && current_iqn==iqn { print "/dev/"$4; exit }
+        ')
+
+      echo "=== Reading from $(hostname) ==="
+      echo "Device: $DEVICE"
+      dd if="$DEVICE" bs=4K count=1 2>/dev/null
+      echo ""
+      echo "=== Keeping pod running ==="
+      sleep 3600
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: dev
+      mountPath: /dev
+      mountPropagation: HostToContainer
+  volumes:
+  - name: dev
+    hostPath:
+      path: /dev
