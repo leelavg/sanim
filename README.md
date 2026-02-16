@@ -201,6 +201,27 @@ nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode node --targetname <IQN> --por
 nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm --mode session
 ```
 
+## Timeouts and Intervals
+
+The system uses several timeouts for session management and pod lifecycle:
+
+**iSCSI Session Timeouts (ds-init.sh):**
+- noop_out_timeout: 5s - Detects unresponsive connections
+- replacement_timeout: 15s - Time before declaring session dead
+  (Monitor loop checks every 10s and reconnects via DNS, so actual recovery is ~10-15s)
+
+**Pod Termination:**
+- terminationGracePeriodSeconds: 30s - Grace period for cleanup (targets and initiators)
+  Allows trap handler to delete IQN, backstores, and logout sessions cleanly
+
+**Monitoring:**
+- Session health check interval: 10s - Monitor loop checks sysfs and reconnects if unhealthy
+- Readiness probe: initialDelaySeconds=10s, periodSeconds=5s
+
+**Retry Logic (ds-init.sh):**
+- Discovery retries: 5 attempts with 2s delay
+- Login retries: 5 attempts with 2s delay
+
 ## Troubleshooting
 
 **No LUNs in target:**

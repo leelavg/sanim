@@ -1,0 +1,95 @@
+sanim Test Plan
+================
+
+Goal: Verify iSCSI block storage works on Kubernetes/OpenShift with StatefulSet targets
+      and DaemonSet initiators, sessions managed by host kernel for persistence.
+
+Prerequisites:
+- OpenShift/Kubernetes cluster with worker nodes
+- Nodes labeled with topology.kubernetes.io/zone
+- oc CLI configured
+- Storage class available (default: gp3-csi)
+
+Test 1: Deploy sanim
+--------------------
+1. Generate zone mapping:
+   bash generate.sh -m
+
+2. Generate resources:
+   bash generate.sh
+
+3. Deploy:
+   oc apply -f node-zone-map.yaml --server-side --force-conflicts
+   oc apply -f resources.yaml --server-side --force-conflicts
+
+4. Wait for pods to be ready:
+   oc get pods -n sanim-system -w
+
+Expected: All pods Running and Ready
+
+
+Test 2: Verify iSCSI sessions established
+------------------------------------------
+1. Check initiator logs:
+   oc logs -n sanim-system ds/initiator
+
+Expected: "Initial iSCSI sessions active" with session list
+
+2. Verify sessions on host kernel:
+   oc debug node/<any-worker-node>
+   chroot /host
+   iscsiadm -m session
+
+Expected: Sessions to targets shown (iqn.2020-05.com.thoughtexpo:storage:*)
+
+
+Test 3: Verify block devices available
+---------------------------------------
+1. Check block devices on node:
+   oc debug node/<any-worker-node>
+   chroot /host
+   lsblk
+
+Expected: New sd* devices corresponding to iSCSI LUNs
+
+
+Test 4: Verify persistence (sessions survive pod restart)
+----------------------------------------------------------
+1. Delete an initiator pod:
+   oc delete pod -n sanim-system <initiator-pod>
+
+2. Check sessions on host (while pod is restarting):
+   oc debug node/<same-node-as-deleted-pod>
+   chroot /host
+   iscsiadm -m session
+
+Expected: Sessions still present (managed by host kernel, not container)
+
+3. Wait for new initiator pod to be ready:
+   oc get pods -n sanim-system -w
+
+Expected: Pod becomes ready, sessions remain stable
+
+
+Test 5: Verify target restart doesn't disrupt IO
+-------------------------------------------------
+1. Delete a target pod:
+   oc delete pod -n sanim-system global-0
+
+2. Monitor initiator logs:
+   oc logs -n sanim-system <initiator-pod> -f
+
+Expected: Initiator detects unhealthy session and reconnects automatically
+
+
+Test 6: Cleanup
+---------------
+Follow cleanup steps in README.md
+
+
+Key Success Criteria:
+- All pods run successfully
+- iSCSI sessions established and visible on host
+- Block devices available on worker nodes
+- Sessions persist across initiator pod restarts (host kernel ownership)
+- Sessions automatically recover when targets restart

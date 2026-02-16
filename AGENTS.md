@@ -15,3 +15,5 @@ This file provides guidance to agents when working with code in this repository.
 `summary.txt` will updated occasionally, like a changelog, look at it when you ONLY need more info.
 
 This project uses a CLI ticket system for task management. Run `tk help` to know more and use it for maximum efficiency in tracking work.
+
+DO NOT CHATTER, MAXIMUM CONCENTRATION ON THE SPECIFIC TASK, CHALLENGE OR ASK THE DESIGN, REACH TO A TRUSTED SOLUTION, TRUST BUT VERIFY THE SOLUTION IN CHUNKS.

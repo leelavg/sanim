@@ -3,6 +3,25 @@ set -euo pipefail
 
 echo "Starting sanim zonal target..."
 
+# Trap handler for graceful shutdown
+cleanup() {
+  echo "Received termination signal, cleaning up target..."
+  IQN="${IQN_PREFIX}:${ZONE}"
+
+  # Delete IQN (this cascades to TPG, LUNs, and backstores)
+  if [ -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
+    targetcli /iscsi delete "$IQN" 2>/dev/null || true
+  fi
+
+  # Clean up any orphaned backstores
+  for i in $(seq 0 $((ZONAL_DISK_COUNT - 1))); do
+    targetcli /backstores/block delete "zonal-lun$i" 2>/dev/null || true
+  done
+
+  exit 0
+}
+trap cleanup SIGTERM SIGINT
+
 # SELinux configuration happens via initiator DaemonSet (runs on all nodes)
 # No need for hostPID on targets - DaemonSet handles it
 
@@ -26,17 +45,8 @@ if [ -z "$ZONE" ]; then
 fi
 echo "Detected zone: $ZONE (node IP: $NODE_IP)"
 
-# Clean up only our specific IQN and backstores
+# Idempotent target creation - only create if not exists
 IQN="${IQN_PREFIX}:${ZONE}"
-if [ -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
-  echo "Cleaning up existing target: $IQN"
-  targetcli /iscsi delete "$IQN" 2>/dev/null || true
-fi
-
-# Clean up our backstores
-for i in $(seq 0 $((ZONAL_DISK_COUNT - 1))); do
-  targetcli /backstores/block delete "zonal-lun$i" 2>/dev/null || true
-done
 
 # Discover LUNs
 LUNS=($(ls /dev/zonal-* 2>/dev/null | sort -V || true))
@@ -52,36 +62,39 @@ if [ ${#LUNS[@]} -ne $EXPECTED_COUNT ]; then
   echo "Discovered LUNs: ${LUNS[@]}"
 fi
 
-# Create iSCSI target with zone suffix
-IQN="${IQN_PREFIX}:${ZONE}"
-targetcli /iscsi create "$IQN"
+# Create iSCSI target only if it doesn't exist
+if [ ! -d "/sys/kernel/config/target/iscsi/${IQN}" ]; then
+  echo "Creating new target: $IQN"
+  targetcli /iscsi create "$IQN"
 
-# Disable TPG before modifying portals (TPG is auto-enabled on creation)
-targetcli /iscsi/$IQN/tpg1 disable
+  # Disable TPG before modifying portals (TPG is auto-enabled on creation)
+  targetcli /iscsi/$IQN/tpg1 disable
 
-# Delete default portal and create on port 3261 to avoid conflict with global (port 3260)
-targetcli /iscsi/$IQN/tpg1/portals delete ::0 3260 2>/dev/null || true
-targetcli /iscsi/$IQN/tpg1/portals create 0.0.0.0 3261
+  # Delete default portal and create on port 3261 to avoid conflict with global (port 3260)
+  targetcli /iscsi/$IQN/tpg1/portals delete ::0 3260 2>/dev/null || true
+  targetcli /iscsi/$IQN/tpg1/portals create 0.0.0.0 3261
 
-# Enable the TPG (this starts the listener)
-targetcli /iscsi/$IQN/tpg1 enable
+  # Enable the TPG (this starts the listener)
+  targetcli /iscsi/$IQN/tpg1 enable
 
-# Configure LUNs
-for i in "${!LUNS[@]}"; do
-  LUN_PATH="${LUNS[$i]}"
-  targetcli /backstores/block create "zonal-lun$i" "$LUN_PATH"
-  targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/zonal-lun$i"
-done
+  # Configure LUNs
+  for i in "${!LUNS[@]}"; do
+    LUN_PATH="${LUNS[$i]}"
+    targetcli /backstores/block create "zonal-lun$i" "$LUN_PATH"
+    targetcli /iscsi/$IQN/tpg1/luns create "/backstores/block/zonal-lun$i"
+  done
 
-# Disable authentication
-targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
-targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
+  # Disable authentication
+  targetcli /iscsi/$IQN/tpg1/acls delete ALL 2>/dev/null || true
+  targetcli /iscsi/$IQN/tpg1 set attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
+else
+  echo "Target $IQN already exists, skipping creation"
+  # Ensure TPG is enabled
+  targetcli /iscsi/$IQN/tpg1 enable 2>/dev/null || true
+fi
 
 echo "Zonal target configured: $IQN with ${#LUNS[@]} LUNs"
 targetcli /iscsi ls
-
-# Save configuration for persistence
-targetcli saveconfig
 
 echo "Target ready and listening on port 3261"
 ss -tlnp | grep 3261 || echo "Warning: Port 3261 not listening"

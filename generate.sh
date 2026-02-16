@@ -144,14 +144,6 @@ $(echo "$STS_ZONAL_SCRIPT" | sed 's/^/    /')
   ds-init.sh: |
 $(echo "$DS_INIT_SCRIPT" | sed 's/^/    /')
 
-#, ServiceAccount for sanim pods
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: sanim
-  namespace: ${NAMESPACE}
-
 #, SecurityContextConstraints for iSCSI targets
 ---
 apiVersion: security.openshift.io/v1
@@ -162,14 +154,12 @@ metadata:
     app.kubernetes.io/name: sanim
 allowHostDirVolumePlugin: true
 allowHostIPC: false
-allowHostNetwork: true
+allowHostNetwork: false
 allowHostPID: false
-allowHostPorts: true
+allowHostPorts: false
+# Using privileged: true is more honest than CAP_SYS_ADMIN (which is almost equivalent)
 allowPrivilegedContainer: true
-allowedCapabilities:
-- SYS_ADMIN
-- SYS_MODULE
-- NET_ADMIN
+allowedCapabilities: null
 defaultAddCapabilities: null
 fsGroup:
   type: RunAsAny
@@ -203,10 +193,9 @@ allowHostIPC: false
 allowHostNetwork: true
 allowHostPID: true
 allowHostPorts: false
+# Using privileged: true is more honest than CAP_SYS_ADMIN (which is almost equivalent)
 allowPrivilegedContainer: true
-allowedCapabilities:
-- SYS_ADMIN
-- SYS_MODULE
+allowedCapabilities: null
 defaultAddCapabilities: null
 fsGroup:
   type: RunAsAny
@@ -274,7 +263,7 @@ spec:
     spec:
       serviceAccountName: sanim-target
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 2
+      terminationGracePeriodSeconds: 30
       # Using pod networking for proper Service routing
       # Note: iSCSI sessions will break on pod restart - initiators must reconnect
       nodeSelector:
@@ -320,7 +309,10 @@ YAML
             command:
             - /bin/bash
             - -c
-            - targetcli /iscsi ls | grep -q 'iqn'
+            - |
+              targetcli /iscsi ls | grep -q 'iqn' && \
+              [ $(targetcli /iscsi ls | grep -c 'o- lun') -gt 0 ] && \
+              ss -tlnp | grep -q ':3260'
           initialDelaySeconds: 10
           periodSeconds: 5
       volumes:
@@ -425,7 +417,7 @@ spec:
     spec:
       serviceAccountName: sanim-target
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 2
+      terminationGracePeriodSeconds: 30
       nodeSelector:
         topology.kubernetes.io/zone: ${ZONE}
       containers:
@@ -476,7 +468,10 @@ YAML
             command:
             - /bin/bash
             - -c
-            - targetcli /iscsi ls | grep -q 'iqn'
+            - |
+              targetcli /iscsi ls | grep -q 'iqn' && \
+              [ $(targetcli /iscsi ls | grep -c 'o- lun') -gt 0 ] && \
+              ss -tlnp | grep -q ':3261'
           initialDelaySeconds: 10
           periodSeconds: 5
       volumes:
@@ -573,7 +568,7 @@ spec:
     spec:
       serviceAccountName: sanim-initiator
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 2
+      terminationGracePeriodSeconds: 30
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
