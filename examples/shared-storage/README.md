@@ -1,12 +1,47 @@
-Shared Storage Example - Multiple pods access same global iSCSI LUN
+# Shared Storage Example
 
-This demonstrates the global target pattern where any pod from any zone can access the same storage.
+This example demonstrates shared storage using the global iSCSI target.
 
-Steps:
-1. Deploy reader: kubectl apply -f shared-reader.yaml
-2. Check logs: kubectl logs -n sanim-system shared-reader
-3. Verify: Pod formats (if needed) and reads data from global LUN
+## What it tests
 
-Use case: Shared content (static websites, shared uploads, read-heavy workloads)
+- Multiple nodes accessing the **same** global LUN
+- Data written from node A is visible on node B
+- Raw block-level I/O across nodes
 
-Note: Init container formats on first run (idempotent), main container mounts read-only
+## How it works
+
+1. **Writer pod**: Runs on any node, writes magic marker + data to global device
+2. **Reader pod**: Runs on a **different** node (via podAntiAffinity), polls for marker, then reads data
+
+Synchronization via magic marker pattern at block 0.
+
+## Usage
+
+```bash
+# Deploy writer first
+oc apply -f writer.yaml
+
+# Wait for writer to write data (check logs)
+oc logs -n sanim-system shared-writer
+
+# Deploy reader (will run on different node)
+oc apply -f reader.yaml
+
+# Check reader logs - should show data from writer
+oc logs -n sanim-system shared-reader -f
+```
+
+## Cleanup
+
+```bash
+oc delete -f reader.yaml
+oc delete -f writer.yaml
+```
+
+## Expected output
+
+Reader should show:
+```
+Data read: Shared storage written at 2026-02-17T... from <writer-node>
+Proof of shared storage: data written from writer node visible on reader node
+```

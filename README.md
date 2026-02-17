@@ -316,6 +316,17 @@ oc delete pvc -n sanim-system --all
 
 Verify: `oc get sc <your-class> -o yaml | grep -E 'volumeBindingMode|volumeMode'`
 
+## Examples
+
+See `examples/` directory for usage examples:
+
+- **examples/shared-storage/**: Demonstrates global target with multi-node access
+  - `writer.yaml` and `reader.yaml` - data written from one node is readable from another
+- **examples/shared-nothing/**: Demonstrates zonal targets with zone isolation
+  - `zonal-test.yaml` - DaemonSet showing all nodes in zone can access zonal storage
+
+Each example includes a README with usage instructions.
+
 ## Validation
 
 Run by human

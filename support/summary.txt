@@ -143,15 +143,17 @@ Known Limitations:
 
 Testing Session (Feb 16, 2026):
 - Validated all components on live cluster, all tests passed
-- dbus mount REQUIRED: targetcli fails without /var/run/dbus (g-io-error-quark)
-- emptyDir for /etc/target: Config must be transient (hostPath causes stale state on pod migration)
-- Full cleanup in trap: Delete IQN + backstores on SIGTERM (not just disable TPG)
-- terminationGracePeriodSeconds: 30s (up from 2s) for proper cleanup
-- Readiness probe: Check IQN + LUNs + port listening (not just IQN existence)
-- WWN generation removed: No benefit (same seed = same WWN, pure overhead)
-- privileged: true: More honest than CAP_SYS_ADMIN which grants ~40 privileged operations
-- Timeouts: noop_out_timeout=5s (connection detection), replacement_timeout=15s (monitor loop recovers faster)
+- Finalized target lifecycle: transient config with trap-based cleanup
+- Established aggressive timeouts for fast failure detection
+- Validated readiness probes cover full target availability
 
 Repository: leelavg/sanim
 Domain: thoughtexpo.com (May 2020)
 Status: Production-ready, battle-tested on live OpenShift clusters
+
+Testing Session (Feb 17, 2026) - Examples:
+- Created examples/shared-storage/ with writer.yaml and reader.yaml
+  - Demonstrates multi-node access to global target via magic marker synchronization
+- Created examples/shared-nothing/ with zonal-test.yaml (DaemonSet)
+  - Demonstrates zone-isolated storage with all nodes in zone accessing zonal target
+- Both examples validated successfully on 2-node cluster

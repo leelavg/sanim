@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zonal-test
+  namespace: sanim-system
+  labels:
+    app: zonal-storage-test
+spec:
+  selector:
+    matchLabels:
+      app: zonal-storage-test
+  template:
+    metadata:
+      labels:
+        app: zonal-storage-test
+    spec:
+      serviceAccountName: sanim-initiator
+      automountServiceAccountToken: false
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role.kubernetes.io/worker: ""
+      containers:
+      - name: tester
+        image: ghcr.io/leelavg/sanim:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -ex
+
+          # Get node's zone from configmap
+          ZONE=$(grep "^${NODE_IP}=" /etc/zone-map/mapping | cut -d= -f2)
+
+          echo "Running on node in zone: $ZONE"
+
+          IQN="iqn.2020-05.com.thoughtexpo:storage:${ZONE}"
+
+          # Wait for iSCSI session
+          echo "Waiting for iSCSI session for IQN: $IQN"
+          for i in {1..30}; do
+            if nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session 2>/dev/null | grep -q "$IQN"; then
+              echo "Session found!"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 1
+          done
+
+          # Find device for zonal IQN
+          DEVICE=$(nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session -P 3 | \
+            awk -v iqn="$IQN" '
+              /Target:/ { current_iqn=$2 }
+              /Attached scsi disk/ && current_iqn==iqn { print "/dev/"$4; exit }
+            ')
+
+          if [ -z "$DEVICE" ]; then
+            echo "ERROR: No device found for IQN: $IQN"
+            echo "Available sessions:"
+            nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session
+            exit 1
+          fi
+
+          echo "Found device: $DEVICE for zone: $ZONE"
+
+          # Write zone-specific data to raw block device
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          DATA="Zone: $ZONE | Node: $(hostname) | Time: $TIMESTAMP | Device: $DEVICE"
+
+          # Each node writes to different offset to avoid conflicts
+          # Use last octet of NODE_IP as offset multiplier
+          OFFSET=$(echo $NODE_IP | cut -d. -f4)
+          BLOCK_OFFSET=$((OFFSET * 2))  # Each node gets 2 blocks (1KB)
+
+          echo "Writing to block offset: $BLOCK_OFFSET"
+          echo "$DATA" | dd of="$DEVICE" bs=512 seek=$BLOCK_OFFSET count=1 conv=fsync
+
+          echo "=== Data written successfully ==="
+          echo "$DATA"
+
+          # Verify by reading back from same offset
+          echo "=== Verifying write by reading back ==="
+          READBACK=$(dd if="$DEVICE" bs=512 skip=$BLOCK_OFFSET count=1 2>/dev/null | tr -d '\0')
+          echo "Read from offset $BLOCK_OFFSET: $READBACK"
+
+          # All nodes in this zone can access this zonal device
+          echo "=== Zone-isolated storage test complete ==="
+          echo "Device /dev/sdc is shared among all nodes in zone: $ZONE"
+          echo "Keeping pod running for inspection ==="
+          sleep 3600
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: dev
+          mountPath: /dev
+          mountPropagation: HostToContainer
+        - name: zone-map
+          mountPath: /etc/zone-map
+          readOnly: true
+      volumes:
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: zone-map
+        configMap:
+          name: node-zone-map

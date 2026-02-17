@@ -17,3 +17,5 @@ This file provides guidance to agents when working with code in this repository.
 This project uses a CLI ticket system for task management. Run `tk help` to know more and use it for maximum efficiency in tracking work.
 
 DO NOT CHATTER, MAXIMUM CONCENTRATION ON THE SPECIFIC TASK, CHALLENGE OR ASK THE DESIGN, REACH TO A TRUSTED SOLUTION, TRUST BUT VERIFY THE SOLUTION IN CHUNKS.
+
+When updating documentation (README, summary.txt, etc), focus on OUTCOMES and FINISHED PRODUCTS, not implementation details or debugging steps. Document what was built and what it does, not how bugs were fixed during development.

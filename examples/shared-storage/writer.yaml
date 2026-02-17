@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-writer
+  namespace: sanim-system
+  labels:
+    app: shared-storage-test
+    role: writer
+spec:
+  serviceAccountName: sanim-initiator
+  hostNetwork: true
+  hostPID: true
+  containers:
+  - name: writer
+    image: ghcr.io/leelavg/sanim:latest
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -ex
+
+      IQN="iqn.2020-05.com.thoughtexpo:storage:global"
+
+      # Wait for iSCSI session to be established
+      echo "Waiting for iSCSI session for IQN: $IQN"
+      for i in {1..30}; do
+        if nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session 2>/dev/null | grep -q "$IQN"; then
+          echo "Session found!"
+          break
+        fi
+        echo "Waiting... ($i/30)"
+        sleep 1
+      done
+
+      # Find device for global IQN
+      DEVICE=$(nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session -P 3 | \
+        awk -v iqn="$IQN" '
+          /Target:/ { current_iqn=$2 }
+          /Attached scsi disk/ && current_iqn==iqn { print "/dev/"$4; exit }
+        ')
+
+      if [ -z "$DEVICE" ]; then
+        echo "ERROR: No device found for IQN: $IQN"
+        echo "Available sessions:"
+        nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session
+        exit 1
+      fi
+
+      echo "Found device: $DEVICE"
+      echo "Writing from node: $(hostname)"
+
+      # Write test data with magic marker for synchronization
+      TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      DATA="Shared storage written at $TIMESTAMP from $(hostname)"
+
+      # Block 0: Magic marker for reader synchronization
+      echo "READY" | dd of="$DEVICE" bs=512 count=1 conv=fsync
+
+      # Block 1: Actual test data
+      echo "$DATA" | dd of="$DEVICE" bs=512 seek=1 count=1 conv=fsync
+
+      echo "=== Data written successfully ==="
+      echo "Magic marker: READY (at block 0)"
+      echo "Test data: $DATA (at block 1)"
+      echo "=== Keeping pod running for inspection ==="
+      sleep 3600
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: dev
+      mountPath: /dev
+      mountPropagation: HostToContainer
+  volumes:
+  - name: dev
+    hostPath:
+      path: /dev

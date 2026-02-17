@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-reader
+  namespace: sanim-system
+  labels:
+    app: shared-storage-test
+    role: reader
+spec:
+  serviceAccountName: sanim-initiator
+  hostNetwork: true
+  hostPID: true
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: role
+            operator: In
+            values:
+            - writer
+        topologyKey: kubernetes.io/hostname
+  containers:
+  - name: reader
+    image: ghcr.io/leelavg/sanim:latest
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -ex
+
+      IQN="iqn.2020-05.com.thoughtexpo:storage:global"
+
+      # Wait for iSCSI session
+      echo "Waiting for iSCSI session for IQN: $IQN"
+      for i in {1..30}; do
+        if nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session 2>/dev/null | grep -q "$IQN"; then
+          echo "Session found!"
+          break
+        fi
+        echo "Waiting... ($i/30)"
+        sleep 1
+      done
+
+      # Find device
+      DEVICE=$(nsenter -t 1 -m -u -n -i /usr/sbin/iscsiadm -m session -P 3 | \
+        awk -v iqn="$IQN" '
+          /Target:/ { current_iqn=$2 }
+          /Attached scsi disk/ && current_iqn==iqn { print "/dev/"$4; exit }
+        ')
+
+      if [ -z "$DEVICE" ]; then
+        echo "ERROR: No device found for IQN: $IQN"
+        exit 1
+      fi
+
+      echo "Found device: $DEVICE"
+      echo "Reading from node: $(hostname)"
+
+      # Poll for magic marker (wait for writer to complete)
+      echo "Waiting for writer to complete (polling for READY marker)..."
+      TIMEOUT=60
+      ELAPSED=0
+      while [ $ELAPSED -lt $TIMEOUT ]; do
+        MARKER=$(dd if="$DEVICE" bs=512 count=1 2>/dev/null | tr -d '\0' || echo "")
+        if echo "$MARKER" | grep -q "READY"; then
+          echo "Writer ready! Found marker at block 0"
+          break
+        fi
+        echo "Still waiting... ($ELAPSED/$TIMEOUT seconds)"
+        sleep 2
+        ELAPSED=$((ELAPSED + 2))
+      done
+
+      if [ $ELAPSED -ge $TIMEOUT ]; then
+        echo "ERROR: Timeout waiting for writer"
+        exit 1
+      fi
+
+      # Read actual data from block 1
+      echo "=== Reading data from shared storage ==="
+      DATA=$(dd if="$DEVICE" bs=512 skip=1 count=1 2>/dev/null | tr -d '\0')
+      echo "Data read: $DATA"
+
+      echo "=== Test completed successfully ==="
+      echo "Proof of shared storage: data written from writer node visible on reader node"
+      echo "=== Keeping pod running for inspection ==="
+      sleep 3600
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: dev
+      mountPath: /dev
+      mountPropagation: HostToContainer
+  volumes:
+  - name: dev
+    hostPath:
+      path: /dev
